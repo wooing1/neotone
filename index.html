@@ -78,6 +78,18 @@ const PHASE_HP   = 2900;      // 페이즈당 기본 HP (파밍으로 오른 화
 // 페이즈별 HP 보정 — 보스가 빠르게 움직이는 페이즈일수록 명중률이 낮아지므로
 // 실측 소요시간이 고르게 나오도록 역보정한다 (숫자는 자동 플레이 실측에서 역산)
 const PHASE_HP_SCALE = [1.05, 1.70, 0.68, 1.15];
+// 온라인 협동: 인원수만큼 화력이 늘어나므로 체력을 보정한다.
+// 다만 실측 DPS는 인원수에 정비례하지 않는다(아이템을 나눠 먹어 파워가 분산되고,
+// 서로 다른 표적을 때린다). 4인 실측 1.6배를 기준으로 페이즈 제한시간(50s) 안에
+// 확실히 끝나도록 보수적으로 잡았다.
+const COOP_HP = [1.00, 1.00, 1.35, 1.70, 2.00];
+function coopAlive(){
+  if (!Net.isOnline()) return 1;
+  let n = 0;
+  for (let i=0;i<MAX_PLAYERS;i++){ const q = Net.players[i]; if (q.present && !q.spectating) n++; }
+  return Math.max(1, Math.min(MAX_PLAYERS, n));
+}
+function coopHP(){ return Net.isOnline() ? (COOP_HP[coopAlive()] || 1) : 1; }
 const MAX_BULLETS = 3000;
 
 // ── 파워 (파밍 보상) ────────────────────────────────
@@ -308,15 +320,17 @@ function aircraftPaint(g, top, bottom, y0, y1){
   return grd;
 }
 
-function bakeF22(white, p2){
+function bakeF22(white, slot){
   const S = 74;
   const c = document.createElement('canvas'); c.width = c.height = S;
   const g = c.getContext('2d');
   g.translate(S/2, S/2);
-  const body = white ? '#ffffff'
-    : (p2 ? aircraftPaint(g, '#fff0dc', '#d1904f', -26, 24)
-          : aircraftPaint(g, '#eaf8ff', '#7fb2cf', -26, 24));
-  const dark = white ? '#ffffff' : (p2 ? '#8b6440' : '#4c718b');
+  const TOP  = ['#eaf8ff', '#fff0dc', '#e9ffef', '#f5ecff'];
+  const BASE = SLOT_COLOR;
+  const DARK = ['#4c718b', '#8b6440', '#3f7d55', '#6b4f8b'];
+  const si = slot || 0;
+  const body = white ? '#ffffff' : aircraftPaint(g, TOP[si], BASE[si], -26, 24);
+  const dark = white ? '#ffffff' : DARK[si];
 
   // 수직미익 2매 (바깥으로 기울어짐)
   g.fillStyle = dark;
@@ -342,14 +356,15 @@ function bakeF22(white, p2){
   g.lineTo(5.2,23); g.lineTo(-5.2,23); g.lineTo(-6.6,14); g.lineTo(-6.2,-3);
   g.lineTo(-3.6,-15);
   g.closePath(); g.fill();
-  g.strokeStyle = white ? '#ffffff' : (p2 ? 'rgba(255,230,190,0.95)' : 'rgba(215,250,255,0.95)');
+  g.strokeStyle = white ? '#ffffff' : SLOT_EDGE[si];
   g.lineWidth = 1.2; g.stroke();
 
   if (!white){
     // 캐노피
     const cg = g.createLinearGradient(0,-17,0,-3);
-    if (p2){ cg.addColorStop(0,'#fffaf0'); cg.addColorStop(0.45,'#ffb454'); cg.addColorStop(1,'#7a3d07'); }
-    else   { cg.addColorStop(0,'#f2ffff'); cg.addColorStop(0.45,'#4fd8ff'); cg.addColorStop(1,'#075b7a'); }
+    const CAN = [['#f2ffff','#4fd8ff','#075b7a'], ['#fffaf0','#ffb454','#7a3d07'],
+                 ['#f2fff6','#5ce89a','#0a6b3c'], ['#faf4ff','#c08cff','#4a1a7a']][si];
+    cg.addColorStop(0, CAN[0]); cg.addColorStop(0.45, CAN[1]); cg.addColorStop(1, CAN[2]);
     g.fillStyle = cg;
     g.beginPath(); g.ellipse(0,-10,3.3,7.2,0,0,TAU); g.fill();
     // 노즐
@@ -562,8 +577,8 @@ function bakeAll(){
     smoke:  bakeSmoke(),
     chip:   bakeChip(),
     // 항공기
-    f22:    bakeF22(false),
-    f22b:   bakeF22(false, true),   // 상대 기체(P2) 도색
+    f22:    bakeF22(false, 0),
+    f22s:   [bakeF22(false,0), bakeF22(false,1), bakeF22(false,2), bakeF22(false,3)],
     pod:    bakePod(false),
     mig21:  bakeMig21(C.mig21, false),  mig21f: bakeMig21(C.mig21, true),
     mig29:  bakeMig29(C.mig29, false),  mig29f: bakeMig29(C.mig29, true),
@@ -845,11 +860,15 @@ function countLiveBullets(){
 }
 
 // 자탄
-const MAX_PSHOT = 300;
+// 4인 협동에서는 자탄이 4배로 나가므로 풀을 넉넉히 잡는다 (풀이 마르면 뒤에 발사한
+// 플레이어의 탄이 통째로 사라져서 화력이 인원수만큼 오르지 않는다)
+const MAX_PSHOT = 1100;
 const pshots = [];
 for (let i=0;i<MAX_PSHOT;i++) pshots.push({on:false,x:0,y:0,vx:0,vy:0,dmg:1,homing:false,life:0,rot:0});
+let pshotCursor = 0;
 function spawnPShot(x,y,vx,vy,dmg,homing){
-  for (let i=0;i<MAX_PSHOT;i++){
+  for (let n=0;n<MAX_PSHOT;n++){
+    const i = pshotCursor; pshotCursor = (pshotCursor + 1) % MAX_PSHOT;
     const s = pshots[i];
     if (!s.on){
       s.on=true; s.x=x; s.y=y; s.vx=vx; s.vy=vy; s.dmg=dmg;
@@ -1004,6 +1023,7 @@ function spawnEnemy(x, y, type, squad, cfg){
       case 'midboss':  e.hp = 3200 * D.hp; e.r = 30; e.dropPower = 10; break;
     }
     if (c.hp) e.hp = c.hp;
+    e.hp *= coopHP();
     e.maxHp = e.hp;
     if (c.homeY !== undefined) e.homeY = c.homeY;
     if (c.amp !== undefined) e.amp = c.amp; else e.amp = 90;
@@ -1030,8 +1050,14 @@ const S = { TITLE:'TITLE', MODE:'MODE', LOBBY:'LOBBY',
    실사용은 WebRTC P2P(PeerJS 공개 브로커), 자동 테스트는 BroadcastChannel.
    게임 코드는 Transport 인터페이스만 알면 되도록 분리한다.
    ═══════════════════════════════════════════════════ */
-const ROOM_NS = 'neotone-v1-';
+const ROOM_NS = 'neotone-v2-';
 const PEERJS_URL = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
+const MAX_PLAYERS = 4;
+// 슬롯별 도색 — 모든 참가자가 같은 색으로 서로를 본다 (P1=나 가 아니라 P1=방장)
+const SLOT_COLOR = ['#7fb2cf', '#d1904f', '#6fcf8a', '#b98cd6'];
+const SLOT_EDGE  = ['rgba(215,250,255,0.95)', 'rgba(255,230,190,0.95)',
+                    'rgba(205,255,220,0.95)', 'rgba(235,215,255,0.95)'];
+const SLOT_LABEL = ['P1', 'P2', 'P3', 'P4'];
 
 function makeRoomCode(){
   const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // 헷갈리는 O0I1 제외
@@ -1039,43 +1065,60 @@ function makeRoomCode(){
   for (let i=0;i<4;i++) r += A[Math.floor(Math.random()*A.length)];
   return r;
 }
+function randId(){ return Math.random().toString(36).slice(2, 10); }
 
-/* ── BroadcastChannel 전송 (같은 오리진 탭 간. 자동 테스트 전용) ── */
+/* ── BroadcastChannel 전송 (같은 오리진 탭. 자동 테스트 전용) ──
+   버스 방식이라 메시지에 from/to를 실어 다자간을 흉내낸다. */
 function BCTransport(){
-  let ch = null, isHost = false, cb = {}, opened = false;
+  let ch = null, isHost = false, cb = {}, myId = randId(), peerIds = [];
   return {
     kind: 'bc',
     open(room, host, handlers){
       isHost = host; cb = handlers;
+      if (isHost) myId = 'host';
       ch = new BroadcastChannel(ROOM_NS + room);
       ch.onmessage = (e) => {
         const m = e.data;
-        if (!m || m.__from === (isHost ? 'h' : 'c')) return;   // 자기 메시지 무시
-        if (m.__sys === 'join' && isHost){
-          opened = true;
-          ch.postMessage({ __from:'h', __sys:'accept' });
-          cb.onOpen && cb.onOpen();
-        } else if (m.__sys === 'accept' && !isHost){
-          opened = true; cb.onOpen && cb.onOpen();
-        } else if (m.__sys === 'bye'){
-          cb.onClose && cb.onClose();
-        } else if (m.__data !== undefined){
-          cb.onData && cb.onData(m.__data);
+        if (!m || m.from === myId) return;
+        if (m.to && m.to !== myId) return;
+        if (m.sys === 'join'){
+          if (!isHost) return;
+          if (peerIds.length >= MAX_PLAYERS - 1){
+            ch.postMessage({ from: myId, to: m.from, sys: 'full' });
+            return;
+          }
+          peerIds.push(m.from);
+          ch.postMessage({ from: myId, to: m.from, sys: 'accept' });
+          cb.onOpen && cb.onOpen(m.from);
+        } else if (m.sys === 'accept'){
+          if (isHost) return;
+          peerIds = ['host'];
+          cb.onOpen && cb.onOpen('host');
+        } else if (m.sys === 'full'){
+          cb.onError && cb.onError('방이 가득 찼습니다 (최대 4인)');
+        } else if (m.sys === 'bye'){
+          peerIds = peerIds.filter(x => x !== m.from);
+          cb.onClose && cb.onClose(m.from);
+        } else if (m.data !== undefined){
+          cb.onData && cb.onData(m.from, m.data);
         }
       };
-      if (isHost) cb.onReady && cb.onReady(room);
-      else { ch.postMessage({ __from:'c', __sys:'join' }); cb.onReady && cb.onReady(room); }
+      cb.onReady && cb.onReady(room);
+      if (!isHost) ch.postMessage({ from: myId, sys: 'join' });
     },
-    send(d){ if (ch) ch.postMessage({ __from: isHost ? 'h' : 'c', __data: d }); },
-    close(){ if (ch){ try{ ch.postMessage({ __from:isHost?'h':'c', __sys:'bye' }); ch.close(); }catch(e){} ch = null; } },
-    get connected(){ return opened; },
+    send(to, d){ if (ch) ch.postMessage({ from: myId, to, data: d }); },
+    broadcast(d){ if (ch) ch.postMessage({ from: myId, to: null, data: d }); },
+    close(){
+      if (ch){ try{ ch.postMessage({ from: myId, sys:'bye' }); ch.close(); }catch(e){} ch = null; }
+      peerIds = [];
+    },
+    get peers(){ return peerIds.slice(); },
   };
 }
 
-/* ── PeerJS(WebRTC) 전송 ── */
+/* ── PeerJS(WebRTC) 전송 — 호스트는 최대 3명을 동시에 받는다 ── */
 let peerLibPromise = null;
 function loadPeerLib(){
-  // 라이브러리는 이 파일에 인라인되어 있다. 혹시 없으면 CDN으로 폴백.
   if (window.Peer) return Promise.resolve();
   if (peerLibPromise) return peerLibPromise;
   peerLibPromise = new Promise((res, rej) => {
@@ -1088,38 +1131,41 @@ function loadPeerLib(){
   return peerLibPromise;
 }
 function PeerTransport(){
-  let peer = null, conn = null, isHost = false, cb = {}, opened = false;
+  let peer = null, isHost = false, cb = {};
+  const conns = new Map();          // peerId → DataConnection
   function bind(c){
-    conn = c;
-    c.on('open', () => { opened = true; cb.onOpen && cb.onOpen(); });
-    c.on('data', d => cb.onData && cb.onData(d));
-    c.on('close', () => { opened = false; cb.onClose && cb.onClose(); });
-    c.on('error', e => cb.onError && cb.onError(e && e.message || '연결 오류'));
+    const id = c.peer;
+    c.on('open', () => { conns.set(id, c); cb.onOpen && cb.onOpen(id); });
+    c.on('data', d => cb.onData && cb.onData(id, d));
+    c.on('close', () => { conns.delete(id); cb.onClose && cb.onClose(id); });
+    c.on('error', () => { conns.delete(id); cb.onClose && cb.onClose(id); });
   }
   return {
     kind: 'peer',
     open(room, host, handlers){
       isHost = host; cb = handlers;
       loadPeerLib().then(() => {
-        // ?peer=host:port[:/path] 로 자체 PeerServer를 지정할 수 있다.
-        // 공개 브로커가 막힌 네트워크(사내망·학교망)를 위한 탈출구.
+        // ?peer=host:port[:/path] 로 자체 PeerServer 지정 가능 (공개 브로커가 막힌 망 대비)
         let opts;
         const mp = /[?&]peer=([^&]+)/.exec(location.search);
         if (mp){
           const parts = decodeURIComponent(mp[1]).split(':');
-          opts = {
-            host: parts[0],
-            port: parts[1] ? parseInt(parts[1], 10) : 443,
-            path: parts[2] ? ('/' + parts[2].replace(/^\//, '')) : '/',
-            secure: location.protocol === 'https:',
-          };
+          opts = { host: parts[0], port: parts[1] ? parseInt(parts[1],10) : 443,
+                   path: parts[2] ? ('/' + parts[2].replace(/^\//,'')) : '/',
+                   secure: location.protocol === 'https:' };
         }
         peer = isHost ? new Peer(ROOM_NS + room, opts) : new Peer(undefined, opts);
         peer.on('open', () => {
           cb.onReady && cb.onReady(room);
           if (!isHost) bind(peer.connect(ROOM_NS + room, { reliable: true }));
         });
-        if (isHost) peer.on('connection', c => { if (!conn) bind(c); else c.close(); });
+        if (isHost) peer.on('connection', c => {
+          if (conns.size >= MAX_PLAYERS - 1){
+            try { c.on('open', () => { c.send({ t:'full' }); setTimeout(()=>c.close(), 300); }); } catch(e){}
+            return;
+          }
+          bind(c);
+        });
         peer.on('error', e => {
           const msg = (e && e.type === 'unavailable-id') ? '이미 사용 중인 방 코드입니다'
                     : (e && e.type === 'peer-unavailable') ? '방을 찾을 수 없습니다'
@@ -1128,61 +1174,100 @@ function PeerTransport(){
         });
       }).catch(err => cb.onError && cb.onError(err.message));
     },
-    send(d){ if (conn && opened) { try { conn.send(d); } catch(e){} } },
+    send(to, d){ const c = conns.get(to); if (c) { try { c.send(d); } catch(e){} } },
+    broadcast(d){ conns.forEach(c => { try { c.send(d); } catch(e){} }); },
     close(){
-      try { if (conn) conn.close(); } catch(e){}
+      conns.forEach(c => { try { c.close(); } catch(e){} });
+      conns.clear();
       try { if (peer) peer.destroy(); } catch(e){}
-      conn = null; peer = null; opened = false;
+      peer = null;
     },
-    get connected(){ return opened; },
+    get peers(){ return Array.from(conns.keys()); },
   };
 }
 
-/* ── 네트워크 상태 ── */
+/* ── 슬롯 하나 = 플레이어 한 명 ── */
+function makeSlot(i){
+  return {
+    slot: i, present: false, ready: false, peerId: null,
+    x: LW/2, y: PF.y + PF.h - 110 + i*10, bank: 0,
+    power: 0, lives: 3, bombs: 3, shield: 0, score: 0,
+    invuln: 0, slow: false, spectating: false, seen: 0, fireTick: 0,
+  };
+}
+
 const Net = {
   mode: 'off',            // 'off' | 'host' | 'client'
   tp: null,
   room: '',
-  status: '',             // 화면에 띄울 안내 문구
-  error: '',
+  mySlot: 0,
+  status: '', error: '',
   connected: false,
-  myReady: false,
-  peerReady: false,
-  peerPresent: false,
-  lastRecv: 0,
-  rtt: 0,
   sendTick: 0,
-  // 원격 기체 (상대 플레이어)
-  remote: {
-    x: LW/2, y: PF.y + PF.h - 140, bank: 0, alive: true, spectating: false,
-    power: 0, lives: 3, bombs: 3, shield: 0, score: 0, invuln: 0, slow: false, seen: 0,
-  },
+  players: [makeSlot(0), makeSlot(1), makeSlot(2), makeSlot(3)],
+
   isOnline(){ return this.mode !== 'off'; },
   isHost(){ return this.mode === 'host'; },
+  me(){ return this.players[this.mySlot]; },
+  others(){ return this.players.filter(p => p.slot !== this.mySlot && p.present); },
+  presentCount(){ return this.players.filter(p => p.present).length; },
+  allReady(){
+    const ps = this.players.filter(p => p.present);
+    return ps.length >= 2 && ps.every(p => p.ready);
+  },
+  slotOfPeer(id){ return this.players.findIndex(p => p.peerId === id); },
+  freeSlot(){ for (let i=1;i<MAX_PLAYERS;i++) if (!this.players[i].present) return i; return -1; },
+
+  reset(){
+    this.players = [makeSlot(0), makeSlot(1), makeSlot(2), makeSlot(3)];
+    this.connected = false; this.mySlot = 0;
+  },
 
   start(kind, room, transportKind){
     this.close();
+    this.reset();
     this.mode = kind;
     this.room = room;
     this.error = '';
-    this.myReady = false; this.peerReady = false; this.peerPresent = false;
     this.status = kind === 'host' ? '방을 여는 중...' : '방에 접속 중...';
+    if (kind === 'host'){
+      this.mySlot = 0;
+      const me = this.players[0];
+      me.present = true; me.peerId = 'me';
+    }
     const TP = (transportKind === 'bc') ? BCTransport : PeerTransport;
     this.tp = TP();
     this.tp.open(room, kind === 'host', {
-      onReady: () => {
-        this.status = kind === 'host' ? '상대를 기다리는 중' : '연결 중...';
+      onReady: () => { this.status = kind === 'host' ? '상대를 기다리는 중' : '연결 중...'; },
+      onOpen: (peerId) => {
+        this.connected = true;
+        if (this.isHost()){
+          const idx = this.freeSlot();
+          if (idx < 0){ this.tp.send(peerId, { t:'full' }); return; }
+          const p = this.players[idx];
+          p.present = true; p.ready = false; p.peerId = peerId; p.seen = performance.now();
+          this.status = '연결됨';
+          this.tp.send(peerId, { t:'welcome', slot: idx, diff: D.key });
+          this.broadcastLobby();
+        } else {
+          this.status = '연결됨';
+        }
       },
-      onOpen: () => {
-        this.connected = true; this.peerPresent = true;
-        this.status = '연결됨';
-        this.send({ t:'hello', host: this.isHost() });
-      },
-      onData: (d) => this.onData(d),
-      onClose: () => {
-        this.connected = false; this.peerPresent = false; this.peerReady = false;
-        this.status = '상대 연결이 끊겼습니다';
-        if (state === S.PLAY || state === S.PAUSE) G && (G.netDropped = true);
+      onData: (peerId, d) => this.onData(peerId, d),
+      onClose: (peerId) => {
+        if (this.isHost()){
+          const idx = this.slotOfPeer(peerId);
+          if (idx > 0){
+            this.players[idx] = makeSlot(idx);
+            this.broadcastLobby();
+          }
+          this.connected = this.presentCount() > 1;
+          this.status = this.connected ? '연결됨' : '상대를 기다리는 중';
+        } else {
+          this.connected = false;
+          this.status = '방장과의 연결이 끊겼습니다';
+          if (G && (state === S.PLAY || state === S.PAUSE)) G.netDropped = true;
+        }
       },
       onError: (m) => { this.error = m; this.status = ''; },
     });
@@ -1190,29 +1275,62 @@ const Net = {
   close(){
     if (this.tp) this.tp.close();
     this.tp = null; this.mode = 'off'; this.connected = false;
-    this.myReady = false; this.peerReady = false; this.peerPresent = false;
+    this.reset();
   },
-  send(o){ if (this.tp) this.tp.send(o); },
-  sendBin(buf){ if (this.tp) this.tp.send(buf); },
+  toHost(o){ if (this.tp) this.tp.send('__host__', o); },
+  sendAll(o){ if (this.tp) this.tp.broadcast(o); },
+  // 클라이언트는 상대가 방장 하나뿐이라 broadcast가 곧 호스트 전송
+  sendUp(o){ if (this.tp) this.tp.broadcast(o); },
 
-  onData(d){
-    this.lastRecv = performance.now();
-    if (d instanceof ArrayBuffer){ netApplyBinary(d); return; }
-    if (ArrayBuffer.isView(d)){ netApplyBinary(d.buffer); return; }
+  broadcastLobby(){
+    if (!this.isHost()) return;
+    this.sendAll({ t:'lobby', p: this.players.map(p => ({ present:p.present, ready:p.ready })) });
+  },
+
+  onData(peerId, d){
+    if (d instanceof ArrayBuffer){ netApplyBinary(peerId, d); return; }
+    if (ArrayBuffer.isView(d)){ netApplyBinary(peerId, d.buffer); return; }
     if (!d || typeof d !== 'object') return;
     switch(d.t){
-      case 'hello':   this.peerPresent = true; break;
-      case 'ready':   this.peerReady = !!d.v; break;
-      case 'start':   // 클라이언트: 호스트가 시작을 알림
+      case 'full':
+        this.error = '방이 가득 찼습니다 (최대 4인)';
+        this.close();
+        break;
+      case 'welcome':                       // 호스트가 내 슬롯을 알려줌
+        this.mySlot = d.slot;
+        this.players[d.slot].present = true;
+        this.players[0].present = true;
+        D = DIFF[d.diff] || D;
+        diffIdx = DIFF_LIST.indexOf(D);
+        break;
+      case 'lobby':                         // 대기실 상태 동기화
+        if (!this.isHost()){
+          d.p.forEach((v, i) => {
+            this.players[i].present = v.present;
+            if (i !== this.mySlot) this.players[i].ready = v.ready;
+          });
+        }
+        break;
+      case 'ready':
+        if (this.isHost()){
+          const idx = this.slotOfPeer(peerId);
+          if (idx >= 0){ this.players[idx].ready = !!d.v; this.broadcastLobby(); }
+        }
+        break;
+      case 'diff':
+        if (!this.isHost()){ D = DIFF[d.v] || D; diffIdx = DIFF_LIST.indexOf(D); }
+        break;
+      case 'start':
         if (!this.isHost()){
           D = DIFF[d.diff] || DIFF.Normal;
           diffIdx = DIFF_LIST.indexOf(D);
-          newRun();
-          state = S.PLAY;
-          Sound.ui();
+          newRun(); state = S.PLAY; Sound.ui();
         }
         break;
-      case 'ev':      netApplyEvent(d); break;
+      case 'ev':
+        netApplyEvent(d);
+        if (this.isHost()) this.sendAll(d);   // 다른 참가자에게 중계
+        break;
     }
   },
 };
@@ -1283,7 +1401,7 @@ function newRun(){
     mode: 'STAGE',                 // 'STAGE' → 'BOSS' ↔ 'INTERLUDE'
     score: 0, graze: 0, grazeCombo: 0,
     lives: D.lives, bombs: 3,
-    phase: 0, phaseHP: PHASE_HP * D.hp, phaseHPMax: PHASE_HP * D.hp,
+    phase: 0, phaseHP: PHASE_HP * D.hp * coopHP(), phaseHPMax: PHASE_HP * D.hp * coopHP(),
     phaseTimer: PHASE_TIME, phaseNoMiss: true, phaseNoBomb: true,
     bonusNoMiss: 0, bonusNoBomb: 0,
     bonusSquad: 0, squadsWiped: 0, enemiesKilled: 0, shieldsUsed: 0,
@@ -1485,9 +1603,11 @@ function killEnemy(e){
   G.enemiesKilled++;
   const boss = (e.type === 'midboss');
   addScore(boss ? 80000 : (e.type === 'turret' ? 5000 : 3000));
-  spawnPower(e.x, e.y, e.dropPower);
-  if (boss){ spawnSpecial(e.x - 22, e.y); spawnSpecial(e.x + 22, e.y); }
-  else if (e.type === 'turret' && Math.random() < 0.25) spawnSpecial(e.x, e.y);
+  // 협동에서는 아이템을 나눠 먹으므로 인원수에 맞춰 드랍을 늘린다
+  const cn = coopAlive();
+  spawnPower(e.x, e.y, e.dropPower * cn);   // 인원수만큼 드랍 — 각자 솔로만큼 파밍되게
+  if (boss){ for (let k=0;k<cn;k++){ spawnSpecial(e.x - 22 + k*14, e.y); spawnSpecial(e.x + 22 - k*14, e.y); } }
+  else if (e.type === 'turret' && Math.random() < 0.25 * cn) spawnSpecial(e.x, e.y);
   explode(e.x, e.y, boss ? 3.2 : 1.0, boss ? '#fff0b0' : '#ffd07a', boss ? '#7a5560' : '#6b4a52');
   if (boss){ shake = Math.max(shake, 16); flash = 0.6; Sound.defeat(); clearBullets(true); }
   else Sound.enemyDie();
@@ -1723,6 +1843,7 @@ function updateInterlude(){
 function reviveIfDown(){
   if (!Net.isOnline() || !G.spectating) return;
   G.spectating = false;
+  if (Net.players[Net.mySlot]) Net.players[Net.mySlot].spectating = false;
   G.lives = 1;
   player.power = 0; player.shield = 0; player.homing = 0;
   player.invuln = 180; player.pendingDeath = -1;
@@ -1734,7 +1855,7 @@ function reviveIfDown(){
 function startPhase(i){
   reviveIfDown();
   G.phase = i;
-  G.phaseHPMax = PHASE_HP * D.hp * (PHASE_HP_SCALE[i] || 1);
+  G.phaseHPMax = PHASE_HP * D.hp * (PHASE_HP_SCALE[i] || 1) * coopHP();
   G.phaseHP = G.phaseHPMax;
   G.phaseTimer = PHASE_TIME;
   G.phaseNoMiss = true; G.phaseNoBomb = true;
@@ -1921,12 +2042,15 @@ function doDeath(){
   player.x = LW/2; player.y = PF.y + PF.h - 90;
   if (G.lives < 0){
     if (Net.isOnline()){
-      // 2인전: 잔기가 떨어지면 관전 → 다음 구간에서 부활
+      // 온라인 협동: 잔기가 떨어지면 관전 → 다음 구간에서 부활
       G.spectating = true;
       G.lives = 0;
       G.banner = 140; G.bannerText = 'DOWN — 다음 구간에 부활';
+      Net.players[Net.mySlot].spectating = true;
       netSendEvent('over', {});
-      if (Net.remote.spectating) endRun(false);   // 둘 다 전멸이면 게임오버
+      // 참가자 전원이 관전 상태면 게임오버
+      const alive = Net.players.filter(p => p.present && !p.spectating).length;
+      if (alive === 0) endRun(false);
     } else {
       endRun(false);
     }
@@ -2120,13 +2244,34 @@ function updatePShots(){
   }
 }
 
+// 협동에서는 아이템이 "가장 가까운 플레이어"에게 끌려가야 한다.
+// (예전엔 호스트 기체만 끌어당겨서 클라이언트는 파워를 거의 못 먹었다)
+const _magT = { x: 0, y: 0 };
+function nearestCoopPlayer(x, y){
+  _magT.x = player.x; _magT.y = player.y;
+  if (!Net.isOnline()) return _magT;
+  let bd = G.spectating ? Infinity : ((player.x-x)*(player.x-x) + (player.y-y)*(player.y-y));
+  for (let i=0;i<MAX_PLAYERS;i++){
+    if (i === Net.mySlot) continue;
+    const q = Net.players[i];
+    if (!q.present || q.spectating) continue;
+    const dd = (q.x-x)*(q.x-x) + (q.y-y)*(q.y-y);
+    if (dd < bd){ bd = dd; _magT.x = q.x; _magT.y = q.y; }
+  }
+  return _magT;
+}
+
 function updateItems(){
   for (let i=0;i<MAX_ITEM;i++){
     const it = items[i];
     if (!it.on) continue;
     it.life++;
-    const dx = player.x - it.x, dy = player.y - it.y;
+    // 끌림은 가장 가까운 플레이어 기준, 실제 획득은 호스트 자기 기체만 (원격은 pick 이벤트로 처리)
+    const mt = nearestCoopPlayer(it.x, it.y);
+    const dx = mt.x - it.x, dy = mt.y - it.y;
     const d = Math.hypot(dx,dy) || 1;
+    const sdx = player.x - it.x, sdy = player.y - it.y;
+    const sd = Math.hypot(sdx, sdy) || 1;
 
     if (it.kind !== 'score'){
       // 파밍 대상 — 천천히 낙하하며, 어느 정도 가까워지면 끌려온다
@@ -2140,7 +2285,7 @@ function updateItems(){
       it.vx *= 0.97;
       it.vy = Math.min(it.vy * 0.99, 3.1);
       it.x += it.vx; it.y += it.vy;
-      if (d < ITEM_PICKUP_R + (special ? 6 : 0)){
+      if (sd < ITEM_PICKUP_R + (special ? 6 : 0) && !G.spectating){
         it.on = false;
         if (it.kind === 'power'){
           addPower(POWER_PER_ITEM); addScore(200);
@@ -2171,9 +2316,9 @@ function updateItems(){
       it.vx += dx/d * pull; it.vy += dy/d * pull + 0.05;
       it.vx *= 0.94; it.vy *= 0.94;
       it.x += it.vx; it.y += it.vy;
-      if (d < 18 || it.life > 200){
+      if (sd < 18 || it.life > 200){
         it.on = false;
-        if (d < 18){ addScore(500); if (Math.random()<0.25) Sound.item(); }
+        if (sd < 18){ addScore(500); if (Math.random()<0.25) Sound.item(); }
       }
     }
   }
@@ -2223,13 +2368,59 @@ const MODE_ID = { STAGE:0, BOSS:1, INTERLUDE:2 };
 const ID_MODE = ['STAGE','BOSS','INTERLUDE'];
 
 const NET_MAX_B = 400, NET_MAX_E = 40, NET_MAX_I = 120;
-let snapBuf = new ArrayBuffer(32 + NET_MAX_B*6 + NET_MAX_E*6 + NET_MAX_I*5);
+// HUD 구간 이름도 1바이트로 실어 보낸다 (클라이언트 HUD가 옛 구간에서 멈추지 않게)
+const SEG_NAMES = ['', 'WAVE 1', 'WAVE 2', 'WAVE 3', 'MID-BOSS', 'INTERCEPT 1', 'INTERCEPT 2', 'INTERCEPT 3'];
+// 헤더(16) + 슬롯 수(1) + 슬롯 4개(60) + 각 배열 길이 필드 — 넉넉히 128바이트 확보
+let snapBuf = new ArrayBuffer(128 + NET_MAX_B*6 + NET_MAX_E*6 + NET_MAX_I*7);
 let snapView = new DataView(snapBuf);
 
+function writeSlot(v, o, p){
+  v.setUint8(o, p.slot); o += 1;
+  v.setInt16(o, Math.round(p.x)); o += 2;
+  v.setInt16(o, Math.round(p.y)); o += 2;
+  v.setInt8(o, Math.round(p.bank * 100)); o += 1;
+  v.setUint8(o, Math.round(Math.min(POWER_MAX, p.power) * 20)); o += 1;
+  v.setUint8(o, Math.max(0, Math.min(255, p.lives))); o += 1;
+  v.setUint8(o, p.bombs); o += 1;
+  v.setUint8(o, p.shield); o += 1;
+  v.setUint8(o, (p.spectating ? 4 : 0) | (p.slow ? 2 : 0) | (p.invuln > 0 ? 1 : 0)); o += 1;
+  v.setUint32(o, Math.min(4294967295, Math.round(p.score))); o += 4;
+  return o;
+}
+function readSlot(v, o, out){
+  const idx = v.getUint8(o); o += 1;
+  const p = out[idx] || out[0];
+  p.x = v.getInt16(o); o += 2;
+  p.y = v.getInt16(o); o += 2;
+  p.bank = v.getInt8(o) / 100; o += 1;
+  p.power = v.getUint8(o) / 20; o += 1;
+  p.lives = v.getUint8(o); o += 1;
+  p.bombs = v.getUint8(o); o += 1;
+  p.shield = v.getUint8(o); o += 1;
+  const fl = v.getUint8(o); o += 1;
+  p.invuln = (fl & 1) ? 1 : 0;
+  p.slow = !!(fl & 2);
+  p.spectating = !!(fl & 4);
+  p.score = v.getUint32(o); o += 4;
+  p.seen = performance.now();
+  p.present = true;
+  return o;
+}
+
+// 호스트가 자기 상태를 슬롯 0에 반영
+function syncHostSlot(){
+  const p = Net.players[Net.mySlot];
+  p.x = player.x; p.y = player.y; p.bank = player.bank;
+  p.power = player.power; p.lives = Math.max(0, G.lives); p.bombs = G.bombs;
+  p.shield = player.shield; p.invuln = player.invuln > 0 ? 1 : 0;
+  p.slow = player.slow; p.spectating = G.spectating; p.score = G.score;
+}
+
 function encodeSnapshot(){
+  syncHostSlot();
   const v = snapView;
   let o = 0;
-  v.setUint8(o, 1); o += 1;                                  // type
+  v.setUint8(o, 1); o += 1;
   v.setUint32(o, frame); o += 4;
   v.setUint8(o, MODE_ID[G.mode] || 0); o += 1;
   v.setUint8(o, G.phase); o += 1;
@@ -2238,18 +2429,18 @@ function encodeSnapshot(){
   v.setInt16(o, Math.round(G.boss.x)); o += 2;
   v.setInt16(o, Math.round(G.boss.y)); o += 2;
   v.setUint8(o, G.boss.alive ? 1 : 0); o += 1;
-  // 호스트 기체
-  v.setInt16(o, Math.round(player.x)); o += 2;
-  v.setInt16(o, Math.round(player.y)); o += 2;
-  v.setInt8(o, Math.round(player.bank * 100)); o += 1;
-  v.setUint8(o, Math.round(player.power * 20)); o += 1;
-  v.setUint8(o, Math.max(0, G.lives)); o += 1;
-  v.setUint8(o, G.bombs); o += 1;
-  v.setUint8(o, player.shield); o += 1;
-  v.setUint8(o, (G.spectating ? 2 : 0) | (player.invuln > 0 ? 1 : 0)); o += 1;
-  v.setUint32(o, Math.min(4294967295, Math.round(G.score))); o += 4;
+  { const si = SEG_NAMES.indexOf(G.stage.waveName); v.setUint8(o, si < 0 ? 0 : si); } o += 1;
 
-  // 탄
+  // 플레이어 슬롯 (present 인 것만)
+  const pOff = o; o += 1;
+  let np = 0;
+  for (let i=0;i<MAX_PLAYERS;i++){
+    if (!Net.players[i].present) continue;
+    o = writeSlot(v, o, Net.players[i]);
+    np++;
+  }
+  v.setUint8(pOff, np);
+
   const bOff = o; o += 2;
   let nb = 0;
   for (let i=0;i<active.length && nb<NET_MAX_B;i++){
@@ -2263,7 +2454,6 @@ function encodeSnapshot(){
   }
   v.setUint16(bOff, nb);
 
-  // 적
   const eOff = o; o += 1;
   let ne = 0;
   for (let i=0;i<MAX_ENEMY && ne<NET_MAX_E;i++){
@@ -2277,12 +2467,12 @@ function encodeSnapshot(){
   }
   v.setUint8(eOff, ne);
 
-  // 아이템
   const iOff = o; o += 1;
   let ni = 0;
   for (let i=0;i<MAX_ITEM && ni<NET_MAX_I;i++){
     const it = items[i];
     if (!it.on) continue;
+    v.setUint16(o, i); o += 2;                     // 아이템 고유 id (풀 인덱스)
     v.setInt16(o, Math.round(it.x)); o += 2;
     v.setInt16(o, Math.round(it.y)); o += 2;
     v.setUint8(o, IKIND_ID[it.kind] || 0); o += 1;
@@ -2293,12 +2483,12 @@ function encodeSnapshot(){
   return snapBuf.slice(0, o);
 }
 
-// 클라이언트가 그릴 월드 (스냅샷으로 갱신)
+// 클라이언트가 그릴 월드
 const NetWorld = {
+  segName: '',
   bullets: [], enemies: [], items: [],
   boss: { x: LW/2, y: PF.y+120, alive: true },
-  phaseHP: 1, phaseHPMax: 1, mode: 'STAGE', phase: 0,
-  frame: 0,
+  phaseHP: 1, phaseHPMax: 1, mode: 'STAGE', phase: 0, frame: 0,
 };
 
 function decodeSnapshot(buf){
@@ -2312,20 +2502,20 @@ function decodeSnapshot(buf){
   NetWorld.boss.x = v.getInt16(o); o += 2;
   NetWorld.boss.y = v.getInt16(o); o += 2;
   NetWorld.boss.alive = !!v.getUint8(o); o += 1;
+  NetWorld.segName = SEG_NAMES[v.getUint8(o)] || ''; o += 1;
 
-  const r = Net.remote;
-  r.x = v.getInt16(o); o += 2;
-  r.y = v.getInt16(o); o += 2;
-  r.bank = v.getInt8(o) / 100; o += 1;
-  r.power = v.getUint8(o) / 20; o += 1;
-  r.lives = v.getUint8(o); o += 1;
-  r.bombs = v.getUint8(o); o += 1;
-  r.shield = v.getUint8(o); o += 1;
-  const fl = v.getUint8(o); o += 1;
-  r.invuln = (fl & 1) ? 1 : 0;
-  r.spectating = !!(fl & 2);
-  r.score = v.getUint32(o); o += 4;
-  r.seen = performance.now();
+  const np = v.getUint8(o); o += 1;
+  const seen = [];
+  for (let i=0;i<np;i++){
+    const idx = v.getUint8(o);
+    seen.push(idx);
+    if (idx === Net.mySlot){ o += 15; continue; }   // 내 슬롯은 로컬이 권위
+    o = readSlot(v, o, Net.players);
+  }
+  for (let i=0;i<MAX_PLAYERS;i++){
+    if (i !== Net.mySlot && seen.indexOf(i) < 0) Net.players[i].present = false;
+    else Net.players[i].present = true;
+  }
 
   const nb = v.getUint16(o); o += 2;
   NetWorld.bullets.length = 0;
@@ -2348,58 +2538,41 @@ function decodeSnapshot(buf){
   const ni = v.getUint8(o); o += 1;
   NetWorld.items.length = 0;
   for (let i=0;i<ni;i++){
+    const id = v.getUint16(o); o += 2;
     const x = v.getInt16(o); o += 2;
     const y = v.getInt16(o); o += 2;
     const k = ID_IKIND[v.getUint8(o)] || 'score'; o += 1;
-    NetWorld.items.push({ x, y, kind:k });
+    NetWorld.items.push({ id, x, y, kind:k });
   }
 }
 
-// 클라이언트 → 호스트 : 자기 기체 상태 (작다)
+// 클라이언트 → 호스트 : 자기 슬롯 상태
 function encodeClientState(){
   const b = new ArrayBuffer(20);
   const v = new DataView(b);
-  let o = 0;
-  v.setUint8(o, 2); o += 1;
-  v.setInt16(o, Math.round(player.x)); o += 2;
-  v.setInt16(o, Math.round(player.y)); o += 2;
-  v.setInt8(o, Math.round(player.bank * 100)); o += 1;
-  v.setUint8(o, Math.round(player.power * 20)); o += 1;
-  v.setUint8(o, Math.max(0, G.lives)); o += 1;
-  v.setUint8(o, G.bombs); o += 1;
-  v.setUint8(o, player.shield); o += 1;
-  v.setUint8(o, (G.spectating ? 4 : 0) | (player.slow ? 2 : 0) | (player.invuln > 0 ? 1 : 0)); o += 1;
-  v.setUint32(o, Math.min(4294967295, Math.round(G.score))); o += 4;
-  return b.slice(0, o);
+  v.setUint8(0, 2);
+  const p = Net.players[Net.mySlot];
+  p.x = player.x; p.y = player.y; p.bank = player.bank;
+  p.power = player.power; p.lives = Math.max(0, G.lives); p.bombs = G.bombs;
+  p.shield = player.shield; p.invuln = player.invuln > 0 ? 1 : 0;
+  p.slow = player.slow; p.spectating = G.spectating; p.score = G.score;
+  writeSlot(v, 1, p);
+  return b;
 }
-function decodeClientState(buf){
+function decodeClientState(peerId, buf){
   const v = new DataView(buf);
-  let o = 1;
-  const r = Net.remote;
-  r.x = v.getInt16(o); o += 2;
-  r.y = v.getInt16(o); o += 2;
-  r.bank = v.getInt8(o) / 100; o += 1;
-  r.power = v.getUint8(o) / 20; o += 1;
-  r.lives = v.getUint8(o); o += 1;
-  r.bombs = v.getUint8(o); o += 1;
-  r.shield = v.getUint8(o); o += 1;
-  const fl = v.getUint8(o); o += 1;
-  r.invuln = (fl & 1) ? 1 : 0;
-  r.slow = !!(fl & 2);
-  r.spectating = !!(fl & 4);
-  r.score = v.getUint32(o); o += 4;
-  r.seen = performance.now();
-  r.alive = !r.spectating;
+  readSlot(v, 1, Net.players);
 }
 
-function netApplyBinary(buf){
+function netApplyBinary(peerId, buf){
   const t = new DataView(buf).getUint8(0);
   if (t === 1 && !Net.isHost()) decodeSnapshot(buf);
-  else if (t === 2 && Net.isHost()) decodeClientState(buf);
+  else if (t === 2 && Net.isHost()) decodeClientState(peerId, buf);
 }
 
 // 드문 이벤트는 JSON으로
 function netApplyEvent(d){
+  if (d.s === Net.mySlot) return;      // 내가 보낸 이벤트가 되돌아온 경우
   switch(d.k){
     case 'bomb':                       // 상대가 봄을 씀 → 월드에서 탄 제거는 호스트가
       if (Net.isHost()){
@@ -2423,25 +2596,31 @@ function netApplyEvent(d){
       break;
     case 'pick':                       // 클라이언트가 아이템을 주움 → 호스트가 제거
       if (Net.isHost()){
-        let best = null, bd = 900;
-        for (let i=0;i<MAX_ITEM;i++){
-          const it = items[i];
-          if (!it.on || it.kind !== d.ik) continue;
-          const dd = (it.x-d.x)*(it.x-d.x) + (it.y-d.y)*(it.y-d.y);
-          if (dd < bd){ bd = dd; best = it; }
+        let best = null;
+        if (d.id !== undefined && items[d.id] && items[d.id].on && items[d.id].kind === d.ik){
+          best = items[d.id];                       // id로 정확히 지목
+        } else {                                    // 구버전 호환 — 가장 가까운 같은 종류
+          let bd = 900;
+          for (let i=0;i<MAX_ITEM;i++){
+            const it = items[i];
+            if (!it.on || it.kind !== d.ik) continue;
+            const dd = (it.x-d.x)*(it.x-d.x) + (it.y-d.y)*(it.y-d.y);
+            if (dd < bd){ bd = dd; best = it; }
+          }
         }
         if (best) best.on = false;
       }
       break;
     case 'over':
-      Net.remote.spectating = true;
+      if (d.s !== undefined && Net.players[d.s]) Net.players[d.s].spectating = true;
       break;
   }
 }
 
 function netSendEvent(k, o){
   if (!Net.isOnline()) return;
-  Net.send(Object.assign({ t:'ev', k }, o || {}));
+  const msg = Object.assign({ t:'ev', k, s: Net.mySlot }, o || {});
+  if (Net.isHost()) Net.sendAll(msg); else Net.sendUp(msg);
 }
 
 function updatePlay(){
@@ -2457,6 +2636,7 @@ function updatePlay(){
     G.mode = NetWorld.mode; G.phase = NetWorld.phase;
     G.phaseHP = NetWorld.phaseHP; G.phaseHPMax = NetWorld.phaseHPMax;
     G.boss.x = NetWorld.boss.x; G.boss.y = NetWorld.boss.y; G.boss.alive = NetWorld.boss.alive;
+    G.stage.waveName = NetWorld.segName || '';
     updatePlayer();
     clientCollide();
     clientPickup();
@@ -2492,29 +2672,30 @@ function updatePlay(){
 function netTick(){
   Net.sendTick++;
   if (Net.isHost()){
-    if (Net.sendTick % 2 === 0 && Net.connected) Net.sendBin(encodeSnapshot());
-    // 클라이언트 기체 위치에서 자탄을 대신 발사해준다 (데미지 판정을 호스트로 일원화)
-    const r = Net.remote;
-    if (!r.spectating && r.lives >= 0 && !G.finished){
+    if (Net.sendTick % 2 === 0 && Net.tp) Net.sendAll(encodeSnapshot());
+    // 접속한 모든 클라이언트의 자탄을 호스트가 대신 발사 (데미지 판정 일원화)
+    for (let i=0;i<MAX_PLAYERS;i++){
+      if (i === Net.mySlot) continue;
+      const r = Net.players[i];
+      if (!r.present || r.spectating || G.finished) continue;
       r.fireTick = (r.fireTick || 0) - 1;
-      if (r.fireTick <= 0){
-        const cfg = POWER_TABLE[Math.min(POWER_MAX, Math.floor(r.power))];
-        r.fireTick = cfg.interval;
-        const nz = 7 * PLAYER_SCALE, ny = 14 * PLAYER_SCALE;
-        spawnPShot(r.x - nz, r.y - ny, 0, -16, cfg.dmg);
-        spawnPShot(r.x + nz, r.y - ny, 0, -16, cfg.dmg);
-        const extra = cfg.shots - 2;
-        const ox = (r.slow ? 15 : 24) * PLAYER_SCALE, oy = (r.slow ? 6 : 14) * PLAYER_SCALE;
-        for (let k=0;k<extra;k++){
-          const side = (k % 2 === 0) ? -1 : 1, tier = Math.floor(k/2);
-          const a = -side * (r.slow ? 0.075 : 0.040) * (1 + tier*0.6);
-          spawnPShot(r.x + side*(ox + tier*11*PLAYER_SCALE), r.y + oy + tier*9*PLAYER_SCALE,
-                     Math.sin(a)*14, -Math.cos(a)*14, cfg.dmg);
-        }
+      if (r.fireTick > 0) continue;
+      const cfg = POWER_TABLE[Math.min(POWER_MAX, Math.floor(r.power))];
+      r.fireTick = cfg.interval;
+      const nz = 7 * PLAYER_SCALE, ny = 14 * PLAYER_SCALE;
+      spawnPShot(r.x - nz, r.y - ny, 0, -16, cfg.dmg);
+      spawnPShot(r.x + nz, r.y - ny, 0, -16, cfg.dmg);
+      const extra = cfg.shots - 2;
+      const ox = (r.slow ? 15 : 24) * PLAYER_SCALE, oy = (r.slow ? 6 : 14) * PLAYER_SCALE;
+      for (let k=0;k<extra;k++){
+        const side = (k % 2 === 0) ? -1 : 1, tier = Math.floor(k/2);
+        const a = -side * (r.slow ? 0.075 : 0.040) * (1 + tier*0.6);
+        spawnPShot(r.x + side*(ox + tier*11*PLAYER_SCALE), r.y + oy + tier*9*PLAYER_SCALE,
+                   Math.sin(a)*14, -Math.cos(a)*14, cfg.dmg);
       }
     }
   } else {
-    if (Net.connected) Net.sendBin(encodeClientState());
+    if (Net.tp) Net.sendUp(encodeClientState());
   }
 }
 
@@ -2541,18 +2722,21 @@ function clientCollide(){
     }
   }
 }
+const clientPicked = new Map();   // 아이템 id → 만료 프레임 (중복 획득 방지)
 function clientPickup(){
   if (G.spectating) return;
+  if (clientPicked.size > 200) clientPicked.clear();
   const its = NetWorld.items;
   for (let i=0;i<its.length;i++){
     const it = its[i];
-    if (it._got) continue;
+    const ex = clientPicked.get(it.id);
+    if (ex !== undefined){ if (frame < ex) continue; clientPicked.delete(it.id); }
     const dx = it.x - player.x, dy = it.y - player.y;
     const special = it.kind !== 'power' && it.kind !== 'score';
     const rr = ITEM_PICKUP_R + (special ? 6 : 0);
     if (dx*dx + dy*dy > rr*rr) continue;
-    it._got = true;
-    netSendEvent('pick', { x: it.x, y: it.y, ik: it.kind });
+    clientPicked.set(it.id, frame + 90);
+    netSendEvent('pick', { id: it.id, x: it.x, y: it.y, ik: it.kind });
     if (it.kind === 'power'){ addPower(POWER_PER_ITEM); addScore(200); Sound.item(); }
     else if (it.kind === 'score'){ addScore(500); }
     else if (it.kind === 'homing'){
@@ -2854,7 +3038,7 @@ function drawPlayer(){
   }
 
   // F-22 본체
-  drawSprite(SPR.f22, 0, 0, 0, 1, PLAYER_SCALE);
+  drawSprite(SPR.f22s[Net.isOnline() ? Net.mySlot : 0], 0, 0, 0, 1, PLAYER_SCALE);
   ctx.restore();   // ← 뱅킹 해제. 아래 판정/실드 표시는 항상 원형이어야 한다
 
   // 실드 링
@@ -2893,46 +3077,50 @@ function drawPlayer(){
 }
 
 // 상대 기체 — 자기 기체와 구분되도록 주황 계열 틴트 + 이름표
-function drawRemote(){
-  if (!Net.isOnline() || !Net.peerPresent) return;
-  const r = Net.remote;
-  if (r.spectating) return;
-  if (performance.now() - r.seen > 3000) return;   // 오래 못 받았으면 숨김
-  ctx.save();
-  ctx.translate(r.x, r.y);
-  ctx.save();
-  ctx.rotate(r.bank * 0.20);
-  ctx.scale(Math.cos(r.bank * 0.92), 1);
-  const ab = 1 + Math.sin(frame*0.5)*0.25;
-  for (const ox of [-3.4*PLAYER_SCALE, 3.4*PLAYER_SCALE]){
-    const len = 24 * ab * PLAYER_SCALE, y0 = 21 * PLAYER_SCALE;
-    const fg = ctx.createLinearGradient(0, y0, 0, y0 + len);
-    fg.addColorStop(0, 'rgba(255,255,255,0.9)');
-    fg.addColorStop(0.25, 'rgba(255,190,120,0.8)');
-    fg.addColorStop(1, 'rgba(255,120,40,0)');
-    ctx.fillStyle = fg;
-    const hw = 3.0 * PLAYER_SCALE;
-    ctx.beginPath();
-    ctx.moveTo(ox-hw, y0); ctx.lineTo(ox+hw, y0); ctx.lineTo(ox, y0+len);
-    ctx.closePath(); ctx.fill();
-  }
-  ctx.globalAlpha = r.invuln ? 0.5 : 1;
-  drawSprite(SPR.f22b, 0, 0, 0, 1, PLAYER_SCALE);
-  ctx.restore();
+function drawRemotes(){
+  if (!Net.isOnline()) return;
+  const now = performance.now();
+  for (let i=0;i<MAX_PLAYERS;i++){
+    if (i === Net.mySlot) continue;
+    const r = Net.players[i];
+    if (!r.present || r.spectating) continue;
+    if (now - r.seen > 3000) continue;         // 오래 못 받았으면 숨김
+    ctx.save();
+    ctx.translate(r.x, r.y);
+    ctx.save();
+    ctx.rotate(r.bank * 0.20);
+    ctx.scale(Math.cos(r.bank * 0.92), 1);
+    const ab = 1 + Math.sin(frame*0.5)*0.25;
+    for (const ox of [-3.4*PLAYER_SCALE, 3.4*PLAYER_SCALE]){
+      const len = 24 * ab * PLAYER_SCALE, y0 = 21 * PLAYER_SCALE;
+      const fg = ctx.createLinearGradient(0, y0, 0, y0 + len);
+      fg.addColorStop(0, 'rgba(255,255,255,0.9)');
+      fg.addColorStop(0.25, SLOT_EDGE[i]);
+      fg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = fg;
+      const hw = 3.0 * PLAYER_SCALE;
+      ctx.beginPath();
+      ctx.moveTo(ox-hw, y0); ctx.lineTo(ox+hw, y0); ctx.lineTo(ox, y0+len);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = r.invuln ? 0.5 : 1;
+    drawSprite(SPR.f22s[i], 0, 0, 0, 1, PLAYER_SCALE);
+    ctx.restore();
 
-  ctx.globalAlpha = 0.9;
-  ctx.fillStyle = '#ffc178';
-  ctx.font = 'bold 8px Menlo, monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('P2', 0, -22);
-  if (r.shield > 0){
-    ctx.globalAlpha = 0.4;
-    ctx.strokeStyle = C.itemShield; ctx.lineWidth = 1.4;
-    ctx.setLineDash([6,6]);
-    ctx.beginPath(); ctx.arc(0, 0, 22, 0, TAU); ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = SLOT_COLOR[i];
+    ctx.font = 'bold 8px Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(SLOT_LABEL[i], 0, -22);
+    if (r.shield > 0){
+      ctx.globalAlpha = 0.4;
+      ctx.strokeStyle = C.itemShield; ctx.lineWidth = 1.4;
+      ctx.setLineDash([6,6]);
+      ctx.beginPath(); ctx.arc(0, 0, 22, 0, TAU); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.restore();
   }
-  ctx.restore();
 }
 
 // 클라이언트: 스냅샷으로 받은 월드를 그린다
@@ -3072,16 +3260,28 @@ function drawHUD(){
   // 파워 게이지
   drawPowerGauge(240, 20);
 
-  // 온라인: 상대 상태 요약
+  // 온라인: 동료 상태 요약 (최대 3명)
   if (Net.isOnline()){
     ctx.save();
     ctx.textAlign = 'right'; ctx.font = '9px Menlo, monospace';
-    const stale = performance.now() - Net.remote.seen > 2000;
-    ctx.fillStyle = !Net.connected ? '#ff6b6b' : (stale ? '#ffd23d' : '#ffa23d');
-    const r = Net.remote;
-    ctx.fillText(!Net.connected ? 'P2 DISCONNECTED'
-      : r.spectating ? 'P2  DOWN'
-      : ('P2  ♥' + Math.max(0,r.lives) + '  Lv.' + Math.floor(r.power)), LW-14, 38);
+    const now = performance.now();
+    let cx = LW - 14;
+    if (!Net.connected){
+      ctx.fillStyle = '#ff6b6b';
+      ctx.fillText('DISCONNECTED', cx, 40);
+    } else {
+      for (let k = MAX_PLAYERS - 1; k >= 0; k--){
+        const p = Net.players[k];
+        if (!p.present || k === Net.mySlot) continue;
+        const stale = now - p.seen > 2000;
+        const txt = p.spectating
+          ? SLOT_LABEL[k] + ' DOWN'
+          : SLOT_LABEL[k] + '♥' + Math.max(0, p.lives) + '·L' + Math.floor(p.power);
+        ctx.fillStyle = p.spectating ? '#ff6b6b' : (stale ? '#ffd23d' : SLOT_COLOR[k]);
+        ctx.fillText(txt, cx, 40);
+        cx -= ctx.measureText(txt).width + 8;
+      }
+    }
     ctx.restore();
   }
   if (G.spectating){
@@ -3108,8 +3308,10 @@ function drawHUD(){
     const bx = 70, bw = LW-140, by = PF.y + 8;
     ctx.font = '10px Menlo, monospace'; ctx.textAlign = 'left';
     ctx.fillStyle = G.mode === 'INTERLUDE' ? '#ffd23d' : C.dim;
+    // 클라이언트는 G.interlude 를 직접 돌리지 않는다(호스트 권위) — 없으면 이름만 표시
+    const nx = (G.interlude && SPELLS[G.interlude.idx + 1]) ? SPELLS[G.interlude.idx + 1].sub : null;
     ctx.fillText(G.mode === 'INTERLUDE'
-      ? (G.stage.waveName + '   —   NEXT: ' + SPELLS[G.interlude.idx + 1].sub)
+      ? (G.stage.waveName + (nx ? ('   —   NEXT: ' + nx) : ''))
       : (G.stage.label + '   ' + G.stage.waveName), bx, by + 4);
     const mb = G.stage.midboss;
     if (mb && mb.on){
@@ -3415,7 +3617,7 @@ function drawTitle(t){
   ctx.strokeStyle = 'rgba(92,255,158,0.65)'; ctx.lineWidth = 1.4;
   ctx.strokeRect(140, 596, 200, 36);
   ctx.fillStyle = '#5cff9e'; ctx.font = 'bold 13px Menlo, monospace';
-  ctx.fillText('ONLINE  2P   ( O )', LW/2, 614);
+  ctx.fillText('ONLINE  CO-OP  2~4P   ( O )', LW/2, 614);
   ctx.restore();
   ctx.fillStyle = 'rgba(255,255,255,0.16)'; ctx.font='10px Menlo, monospace';
   ctx.fillText('SOUND ' + (Sound.isMuted() ? 'OFF' : 'ON') + '  (M)', LW/2, 600);
@@ -3465,7 +3667,7 @@ function drawModeSelect(t){
   ctx.restore();
 
   btn(90, 230, 300, 62, 'solo',  'SOLO',       '혼자 플레이', true, C.player);
-  btn(90, 306, 300, 62, 'host',  'CREATE ROOM','방을 만들고 코드를 공유', true, '#5cff9e');
+  btn(90, 306, 300, 62, 'host',  'CREATE ROOM','방을 만들고 코드를 공유 (최대 4인)', true, '#5cff9e');
   btn(90, 382, 300, 62, 'join',  'JOIN ROOM',  '친구가 준 4자리 코드로 참가', true, '#ffd23d');
   btn(150, 470, 180, 40, 'back', 'BACK', '', false);
 
@@ -3477,7 +3679,7 @@ function drawModeSelect(t){
   }
   ctx.save(); ctx.textAlign='center'; ctx.fillStyle = C.dim;
   ctx.font = '10px Menlo, monospace';
-  ctx.fillText('온라인은 WebRTC P2P로 직접 연결됩니다 (공개 시그널링 브로커 사용)', LW/2, 566);
+  ctx.fillText('온라인 협동 최대 4인 · WebRTC P2P 직접 연결 (공개 시그널링 브로커)', LW/2, 566);
   ctx.restore();
 }
 
@@ -3515,70 +3717,69 @@ function drawLobby(t){
   uiBtns.length = 0;
   ctx.save();
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.font = 'bold 24px Menlo, monospace'; ctx.fillStyle = '#ffffff';
-  ctx.fillText('LOBBY', LW/2, 120);
+  ctx.font = 'bold 22px Menlo, monospace'; ctx.fillStyle = '#ffffff';
+  ctx.fillText('LOBBY', LW/2, 96);
 
-  // 방 코드
   ctx.font = '10px Menlo, monospace'; ctx.fillStyle = C.dim;
-  ctx.fillText('ROOM CODE', LW/2, 152);
-  ctx.font = 'bold 40px Menlo, monospace';
+  ctx.fillText('ROOM CODE', LW/2, 124);
+  ctx.font = 'bold 36px Menlo, monospace';
   ctx.fillStyle = '#5cff9e';
-  ctx.fillText(Net.room, LW/2, 184);
-  if (Net.isHost()){
-    ctx.font = '10px Menlo, monospace'; ctx.fillStyle = C.dim;
-    ctx.fillText('이 코드를 친구에게 알려주세요', LW/2, 210);
-  }
+  ctx.fillText(Net.room, LW/2, 154);
+  ctx.font = '10px Menlo, monospace'; ctx.fillStyle = C.dim;
+  ctx.fillText(Net.isHost() ? '이 코드를 친구에게 알려주세요  (최대 4인)'
+                            : '방장이 시작하면 함께 출격합니다', LW/2, 178);
 
-  // 플레이어 슬롯
-  const rows = [
-    { name: Net.isHost() ? 'P1  (나 · 호스트)' : 'P1  (호스트)',
-      ready: Net.isHost() ? Net.myReady : Net.peerReady,
-      here: Net.isHost() ? true : Net.peerPresent, col: C.player },
-    { name: Net.isHost() ? 'P2  (상대)' : 'P2  (나)',
-      ready: Net.isHost() ? Net.peerReady : Net.myReady,
-      here: Net.isHost() ? Net.peerPresent : true, col: '#ffa23d' },
-  ];
-  rows.forEach((r, i) => {
-    const y = 240 + i*62;
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 1;
-    ctx.strokeRect(70, y, 340, 52);
-    ctx.textAlign = 'left'; ctx.font = 'bold 13px Menlo, monospace';
-    ctx.fillStyle = r.here ? r.col : 'rgba(255,255,255,0.25)';
-    ctx.fillText(r.name, 88, y + 26);
-    ctx.textAlign = 'right'; ctx.font = 'bold 12px Menlo, monospace';
-    if (!r.here){ ctx.fillStyle = C.dim; ctx.fillText('대기 중...', 394, y + 26); }
-    else if (r.ready){ ctx.fillStyle = '#5cff9e'; ctx.fillText('READY', 394, y + 26); }
-    else { ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fillText('NOT READY', 394, y + 26); }
-  });
+  // 4 슬롯
+  for (let i=0;i<MAX_PLAYERS;i++){
+    const p = Net.players[i];
+    const y = 200 + i*46;
+    const mine = (i === Net.mySlot);
+    ctx.strokeStyle = p.present ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(60, y, 360, 38);
+    if (p.present){
+      ctx.globalAlpha = 0.10; ctx.fillStyle = SLOT_COLOR[i];
+      ctx.fillRect(60, y, 360, 38); ctx.globalAlpha = 1;
+    }
+    ctx.textAlign = 'left'; ctx.font = 'bold 12px Menlo, monospace';
+    ctx.fillStyle = p.present ? SLOT_COLOR[i] : 'rgba(255,255,255,0.22)';
+    const tag = SLOT_LABEL[i] + (i === 0 ? '  방장' : '') + (mine ? '  · 나' : '');
+    ctx.fillText(p.present ? tag : (SLOT_LABEL[i] + '  빈 자리'), 76, y + 20);
+
+    ctx.textAlign = 'right'; ctx.font = 'bold 11px Menlo, monospace';
+    if (!p.present){ ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillText('—', 404, y + 20); }
+    else if (p.ready){ ctx.fillStyle = '#5cff9e'; ctx.fillText('READY', 404, y + 20); }
+    else { ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fillText('NOT READY', 404, y + 20); }
+  }
 
   ctx.textAlign = 'center';
   ctx.font = '11px Menlo, monospace'; ctx.fillStyle = Net.error ? '#ff6b6b' : C.dim;
-  ctx.fillText(Net.error || Net.status, LW/2, 382);
+  ctx.fillText(Net.error || Net.status, LW/2, 400);
   ctx.restore();
 
-  const bothReady = Net.connected && Net.myReady && Net.peerReady;
-  btn(90, 402, 300, 48, 'ready', Net.myReady ? 'CANCEL READY' : 'READY',
-      '', Net.myReady, Net.myReady ? '#ffd23d' : C.player);
+  const canStart = Net.allReady();
+  const meReady = Net.players[Net.mySlot].ready;
+  btn(90, 416, 300, 42, 'ready', meReady ? 'CANCEL READY' : 'READY',
+      '', meReady, meReady ? '#ffd23d' : C.player);
   if (Net.isHost()){
-    btn(90, 462, 300, 52, 'start', 'START',
-        bothReady ? '' : '두 명 모두 준비되면 시작할 수 있습니다',
-        bothReady, '#5cff9e');
+    btn(90, 466, 300, 46, 'start', 'START',
+        canStart ? '' : (Net.presentCount() < 2 ? '최소 2명이 필요합니다' : '전원 준비되면 시작할 수 있습니다'),
+        canStart, '#5cff9e');
   } else {
     ctx.save(); ctx.textAlign='center'; ctx.fillStyle = C.dim;
     ctx.font='11px Menlo, monospace';
-    ctx.fillText(bothReady ? '호스트가 시작하기를 기다리는 중...' : '준비를 누르세요', LW/2, 486);
+    ctx.fillText(canStart ? '방장이 시작하기를 기다리는 중...' : '준비를 누르세요', LW/2, 488);
     ctx.restore();
   }
-  // 난이도(호스트만)
   if (Net.isHost()){
     ctx.save(); ctx.textAlign='center'; ctx.fillStyle=C.dim; ctx.font='10px Menlo, monospace';
-    ctx.fillText('난이도  ← →  로 변경', LW/2, 534); ctx.restore();
+    ctx.fillText('난이도  ← →  로 변경', LW/2, 530); ctx.restore();
     DIFF_LIST.forEach((d, i) => {
       const w = 96, x = LW/2 - (w*3 + 16)/2 + i*(w+8);
-      btn(x, 546, w, 34, 'diff'+i, d.key.toUpperCase(), '', i === diffIdx, d.color);
+      btn(x, 542, w, 32, 'diff'+i, d.key.toUpperCase(), '', i === diffIdx, d.color);
     });
   }
-  btn(160, 592, 160, 30, 'back', 'LEAVE', '', false);
+  btn(160, 588, 160, 30, 'back', 'LEAVE', '', false);
 }
 
 function drawResult(cleared){
@@ -3688,21 +3889,23 @@ function handleStateInput(){
       return;
     }
     if (id === 'ready' || Input.wasPressed('SHOT')){
-      Net.myReady = !Net.myReady;
-      Net.send({ t:'ready', v: Net.myReady });
+      const me = Net.players[Net.mySlot];
+      me.ready = !me.ready;
+      if (Net.isHost()) Net.broadcastLobby(); else Net.sendUp({ t:'ready', v: me.ready });
       Sound.ui();
     } else if (id === 'start' || (Input.wasPressed('OK') && Net.isHost())){
-      if (Net.isHost() && Net.connected && Net.myReady && Net.peerReady){
-        Net.send({ t:'start', diff: D.key });
+      if (Net.isHost() && Net.allReady()){
+        Net.sendAll({ t:'start', diff: D.key });
         newRun(); state = S.PLAY; Sound.ui();
       }
     } else if (id === 'back'){ Net.close(); state = S.MODE; Sound.ui(); }
     else if (id && id.startsWith('diff') && Net.isHost()){
-      diffIdx = parseInt(id.slice(4), 10); D = DIFF_LIST[diffIdx]; Sound.ui();
+      diffIdx = parseInt(id.slice(4), 10); D = DIFF_LIST[diffIdx];
+      Net.sendAll({ t:'diff', v: D.key }); Sound.ui();
     }
     if (Net.isHost()){
-      if (Input.wasPressed('L')){ diffIdx = (diffIdx+2)%3; D = DIFF_LIST[diffIdx]; Sound.ui(); }
-      if (Input.wasPressed('R')){ diffIdx = (diffIdx+1)%3; D = DIFF_LIST[diffIdx]; Sound.ui(); }
+      if (Input.wasPressed('L')){ diffIdx = (diffIdx+2)%3; D = DIFF_LIST[diffIdx]; Net.sendAll({t:'diff',v:D.key}); Sound.ui(); }
+      if (Input.wasPressed('R')){ diffIdx = (diffIdx+1)%3; D = DIFF_LIST[diffIdx]; Net.sendAll({t:'diff',v:D.key}); Sound.ui(); }
     }
     if (Input.wasPressed('PAUSE')){ Net.close(); state = S.MODE; Sound.ui(); }
     return;
@@ -3752,11 +3955,11 @@ function handleStateInput(){
   if (state === S.GAMEOVER || state === S.CLEAR){
     Input.consumeUiTap();
     if (Net.isOnline()){
-      // 2인전은 각자 리트라이하면 어긋나므로 대기실로 돌아간다
+      // 온라인 협동은 각자 리트라이하면 어긋나므로 대기실로 돌아간다
       if (Input.wasPressed('RETRY') || Input.wasPressed('SHOT') ||
           Input.wasPressed('OK') || Input.wasPressed('PAUSE') || Input.tapAnywhere){
-        Net.myReady = false; Net.peerReady = false;
-        Net.send({ t:'ready', v:false });
+        Net.players.forEach(p => p.ready = false);
+        if (Net.isHost()) Net.broadcastLobby(); else Net.sendUp({ t:'ready', v:false });
         state = S.LOBBY; Sound.ui();
       }
       return;
@@ -3836,7 +4039,7 @@ function loop(now){
       drawBoss();
       drawParts();
       drawRings();
-      drawRemote();
+      drawRemotes();
       drawPlayer();
     } else {
       drawItems();
@@ -3845,7 +4048,7 @@ function loop(now){
       drawParts();
       drawRings();
       drawPShots();
-      drawRemote();
+      drawRemotes();
       drawPlayer();
       drawBullets();
     }
@@ -3934,19 +4137,36 @@ window.__game = {
     if (!G) return null;
     if (G.mode === 'BOSS' && G.boss.alive) return { x: G.boss.x, y: G.boss.y };
     let best = null, bestY = -1e9;
-    for (let i=0;i<MAX_ENEMY;i++){
-      const e = enemies[i];
-      if (e.on && e.y > bestY){ bestY = e.y; best = e; }
+    // 온라인 클라이언트는 월드가 로컬에 없다 — 호스트가 보내준 NetWorld를 본다
+    if (Net.isOnline() && !Net.isHost()){
+      for (let i=0;i<NetWorld.enemies.length;i++){
+        const e = NetWorld.enemies[i];
+        if (e.y > bestY){ bestY = e.y; best = e; }
+      }
+    } else {
+      for (let i=0;i<MAX_ENEMY;i++){
+        const e = enemies[i];
+        if (e.on && e.y > bestY){ bestY = e.y; best = e; }
+      }
     }
     return best ? { x: best.x, y: best.y } : null;
   },
   nearestPower(){              // 자동 테스트용: 가장 가까운 파워 아이템
     let best = null, bd = 1e9;
-    for (let i=0;i<MAX_ITEM;i++){
-      const it = items[i];
-      if (!it.on || it.kind !== 'power') continue;
-      const d = Math.hypot(it.x-player.x, it.y-player.y);
-      if (d < bd){ bd = d; best = it; }
+    if (Net.isOnline() && !Net.isHost()){
+      for (let i=0;i<NetWorld.items.length;i++){
+        const it = NetWorld.items[i];
+        if (it.kind !== 'power') continue;
+        const d = Math.hypot(it.x-player.x, it.y-player.y);
+        if (d < bd){ bd = d; best = it; }
+      }
+    } else {
+      for (let i=0;i<MAX_ITEM;i++){
+        const it = items[i];
+        if (!it.on || it.kind !== 'power') continue;
+        const d = Math.hypot(it.x-player.x, it.y-player.y);
+        if (d < bd){ bd = d; best = it; }
+      }
     }
     return best ? { x: best.x, y: best.y } : null;
   },
@@ -3954,11 +4174,13 @@ window.__game = {
   bomb(){ Input.pressed.BOMB = true; },
   hurtBoss(n){ if (G) damageBoss(n); },
   get net(){ return { mode: Net.mode, room: Net.room, connected: Net.connected,
-                      myReady: Net.myReady, peerReady: Net.peerReady, peerPresent: Net.peerPresent,
+                      mySlot: Net.mySlot, presentCount: Net.presentCount(), allReady: Net.allReady(),
+                      myReady: Net.me() ? Net.me().ready : false,
                       status: Net.status, error: Net.error, lobbyRole,
-                      remote: { x: Math.round(Net.remote.x), y: Math.round(Net.remote.y),
-                                lives: Net.remote.lives, power: +Net.remote.power.toFixed(2),
-                                spectating: Net.remote.spectating },
+                      players: Net.players.map(p => ({ slot: p.slot, present: p.present, ready: p.ready,
+                                x: Math.round(p.x), y: Math.round(p.y),
+                                lives: p.lives, power: +p.power.toFixed(2),
+                                spectating: p.spectating })),
                       world: { bullets: NetWorld.bullets.length, enemies: NetWorld.enemies.length,
                                items: NetWorld.items.length, mode: NetWorld.mode, phase: NetWorld.phase } }; },
   uiTap(id){ for (const b of uiBtns) if (b.id === id){ Input.uiTap = { x: b.x + b.w/2, y: b.y + b.h/2 }; return true; } return false; },
@@ -3966,6 +4188,7 @@ window.__game = {
   setBloom(v){ BLOOM_STRENGTH = v; },
   setPartQuality(v){ partQuality = v; },
   get partQualityNow(){ return partQuality; },
+  get fps(){ if (!fpsSamples.length) return 0; return fpsSamples.reduce((a,b)=>a+b,0)/fpsSamples.length; },
   get partCount(){ let n=0; for (let i=0;i<MAX_PART;i++) if (parts[i].on) n++; return n; },
   get bloom(){ return BLOOM_STRENGTH; },
   stress(n){   // 성능 측정용: 화면 안을 도는 탄을 n개 강제 생성
