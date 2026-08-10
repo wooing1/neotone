@@ -3612,15 +3612,15 @@ function drawTitle(t){
     ctx.fillStyle = '#ffe66d'; ctx.font = '12px Menlo, monospace';
     ctx.fillText('BEST  ' + fmt(bestScore), LW/2, 552);
   }
-  // 온라인 2인 진입
+  // 온라인 협동 진입 (라벨이 길어져 박스를 넓혔다)
   ctx.save();
   ctx.strokeStyle = 'rgba(92,255,158,0.65)'; ctx.lineWidth = 1.4;
-  ctx.strokeRect(140, 596, 200, 36);
+  ctx.strokeRect(118, 596, 244, 36);
   ctx.fillStyle = '#5cff9e'; ctx.font = 'bold 13px Menlo, monospace';
   ctx.fillText('ONLINE  CO-OP  2~4P   ( O )', LW/2, 614);
   ctx.restore();
   ctx.fillStyle = 'rgba(255,255,255,0.16)'; ctx.font='10px Menlo, monospace';
-  ctx.fillText('SOUND ' + (Sound.isMuted() ? 'OFF' : 'ON') + '  (M)', LW/2, 600);
+  ctx.fillText('SOUND ' + (Sound.isMuted() ? 'OFF' : 'ON') + '  (M)', LW/2, 578);   // 버튼 박스와 겹치지 않게 위로
   ctx.restore();
 }
 
@@ -3926,7 +3926,7 @@ function handleStateInput(){
       }
       if (!hitBtn) started = true;
     }
-    if (tap && tap.y >= 596 && tap.y <= 632 && tap.x >= 140 && tap.x <= 340){
+    if (tap && tap.y >= 596 && tap.y <= 632 && tap.x >= 118 && tap.x <= 362){
       Net.error = ''; state = S.MODE; Sound.ui(); return;
     }
     if (Input.wasPressed('MODE_KEY')){ Net.error=''; state = S.MODE; Sound.ui(); return; }
