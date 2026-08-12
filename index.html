@@ -2414,7 +2414,10 @@ function updateBullets(){
 function updatePShots(){
   const b = G.boss;
   const bossR = 42;   // 코어 + 안쪽 링에 맞춘 반경
-  const bossHittable = (G.mode === 'BOSS' && b.alive && G.transition <= 0);
+  // 데미지 판정은 호스트 한 곳에서만 한다. 클라이언트는 자탄을 "보여주기 위해"
+  // 똑같이 날려 보내기만 한다 (직선이라 호스트 쪽과 눈에 띄게 어긋나지 않는다).
+  const visualOnly = Net.isOnline() && !Net.isHost();
+  const bossHittable = !visualOnly && (G.mode === 'BOSS' && b.alive && G.transition <= 0);
   for (let i=0;i<MAX_PSHOT;i++){
     const s = pshots[i];
     if (!s.on) continue;
@@ -2454,6 +2457,7 @@ function updatePShots(){
       }
     }
     // 잡몹 / 중간보스 피격
+    if (visualOnly) continue;
     for (let k=0;k<MAX_ENEMY;k++){
       const e = enemies[k];
       if (!e.on) continue;
@@ -2869,6 +2873,7 @@ function updatePlay(){
     updatePlayer();
     clientCollide();
     clientPickup();
+    updatePShots();      // ★ 이게 빠져 있어서 자탄이 발사만 되고 멈춰 있었다
     updateParts();
     updateRings();
     if (shake > 0) shake *= 0.88;
@@ -2898,34 +2903,41 @@ function updatePlay(){
 }
 
 /* ── 온라인: 송신 주기 및 상대 기체 보간 ── */
+// 동료들의 자탄을 쏜다.
+//   호스트에서는 이게 실제 데미지 판정이 되고 (판정을 한 곳으로 모으기 위해),
+//   클라이언트에서는 화면에만 나온다 (updatePShots 가 클라에서는 판정을 건너뛴다).
+//   클라에서도 쏘지 않으면 동료 옆에서 적이 저절로 죽는 것처럼 보인다.
+function fireMateShots(){
+  for (let i=0;i<MAX_PLAYERS;i++){
+    if (i === Net.mySlot) continue;
+    const r = Net.players[i];
+    if (!r.present || r.spectating || G.finished) continue;
+    r.fireTick = (r.fireTick || 0) - 1;
+    if (r.fireTick > 0) continue;
+    const cfg = POWER_TABLE[Math.min(POWER_MAX, Math.floor(r.power))];
+    r.fireTick = cfg.interval;
+    const nz = 7 * PLAYER_SCALE, ny = 14 * PLAYER_SCALE;
+    spawnPShot(r.x - nz, r.y - ny, 0, -16, cfg.dmg);
+    spawnPShot(r.x + nz, r.y - ny, 0, -16, cfg.dmg);
+    const extra = cfg.shots - 2;
+    const ox = (r.slow ? 15 : 24) * PLAYER_SCALE, oy = (r.slow ? 6 : 14) * PLAYER_SCALE;
+    for (let k=0;k<extra;k++){
+      const side = (k % 2 === 0) ? -1 : 1, tier = Math.floor(k/2);
+      const a = -side * (r.slow ? 0.075 : 0.040) * (1 + tier*0.6);
+      spawnPShot(r.x + side*(ox + tier*11*PLAYER_SCALE), r.y + oy + tier*9*PLAYER_SCALE,
+                 Math.sin(a)*14, -Math.cos(a)*14, cfg.dmg);
+    }
+  }
+}
+
 function netTick(){
   Net.sendTick++;
   if (Net.isHost()){
     if (Net.sendTick % 2 === 0 && Net.tp) Net.sendAll(encodeSnapshot());
-    // 접속한 모든 클라이언트의 자탄을 호스트가 대신 발사 (데미지 판정 일원화)
-    for (let i=0;i<MAX_PLAYERS;i++){
-      if (i === Net.mySlot) continue;
-      const r = Net.players[i];
-      if (!r.present || r.spectating || G.finished) continue;
-      r.fireTick = (r.fireTick || 0) - 1;
-      if (r.fireTick > 0) continue;
-      const cfg = POWER_TABLE[Math.min(POWER_MAX, Math.floor(r.power))];
-      r.fireTick = cfg.interval;
-      const nz = 7 * PLAYER_SCALE, ny = 14 * PLAYER_SCALE;
-      spawnPShot(r.x - nz, r.y - ny, 0, -16, cfg.dmg);
-      spawnPShot(r.x + nz, r.y - ny, 0, -16, cfg.dmg);
-      const extra = cfg.shots - 2;
-      const ox = (r.slow ? 15 : 24) * PLAYER_SCALE, oy = (r.slow ? 6 : 14) * PLAYER_SCALE;
-      for (let k=0;k<extra;k++){
-        const side = (k % 2 === 0) ? -1 : 1, tier = Math.floor(k/2);
-        const a = -side * (r.slow ? 0.075 : 0.040) * (1 + tier*0.6);
-        spawnPShot(r.x + side*(ox + tier*11*PLAYER_SCALE), r.y + oy + tier*9*PLAYER_SCALE,
-                   Math.sin(a)*14, -Math.cos(a)*14, cfg.dmg);
-      }
-    }
   } else {
     if (Net.tp) Net.sendUp(encodeClientState());
   }
+  fireMateShots();
 }
 
 /* ── 클라이언트: 스냅샷 탄으로 자기 피격/그레이즈를 직접 판정 (입력 지연 없이) ── */
@@ -3725,7 +3737,7 @@ function applyBloom(){
   ctx = glowActx; drawScale = gs;
   ctx.setTransform(gs, 0, 0, gs, shakeX*gs, shakeY*gs);
   if (G && state !== S.TITLE && state !== S.MODE && state !== S.LOBBY){
-    if (Net.isOnline() && !Net.isHost()) drawNetWorld();
+    if (Net.isOnline() && !Net.isHost()){ drawNetWorld(); drawPShots(); }
     else { drawPShots(); drawBullets(); }
     drawParts();
     drawRings();
@@ -4347,6 +4359,7 @@ function loop(now){
       drawBoss();
       drawParts();
       drawRings();
+      drawPShots();      // ★ 빠져 있었다 — 클라이언트 화면에 자탄이 아예 안 그려졌다
       drawRemotes();
       drawPlayer();
     } else {
@@ -4500,6 +4513,7 @@ window.__game = {
   setPartQuality(v){ partQuality = v; },
   get partQualityNow(){ return partQuality; },
   get fps(){ if (!fpsSamples.length) return 0; return fpsSamples.reduce((a,b)=>a+b,0)/fpsSamples.length; },
+  get pshotCount(){ let n=0; for (let i=0;i<MAX_PSHOT;i++) if (pshots[i].on) n++; return n; },
   get partCount(){ let n=0; for (let i=0;i<MAX_PART;i++) if (parts[i].on) n++; return n; },
   get bloom(){ return BLOOM_STRENGTH; },
   stress(n){   // 성능 측정용: 화면 안을 도는 탄을 n개 강제 생성
