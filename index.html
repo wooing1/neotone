@@ -1139,6 +1139,36 @@ function BCTransport(){
   };
 }
 
+/* ── ICE 설정 ──
+   PeerJS 기본값에 들어 있는 TURN(eu-0/us-0.turn.peerjs.com)은 현재 응답하지 않는다
+   (ICE 오류 701 = 서버 도달 불가). STUN 만으로는 대칭형 NAT·UDP 차단 회선을 뚫지 못하고,
+   그때 연결이 "조용히" 실패한다. 그래서
+     1) STUN 후보를 여러 곳 두고
+     2) ?turn=turn:호스트:포트|아이디|비번  으로 릴레이를 직접 꽂을 수 있게 했다.
+   여러 개를 넣으려면 콤마로 잇는다. */
+const STUN_LIST = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:stun2.l.google.com:19302',
+  'stun:stun.cloudflare.com:3478',
+];
+function iceServers(){
+  const list = [{ urls: STUN_LIST }];
+  const mt = /[?&]turn=([^&]+)/.exec(location.search);
+  if (mt){
+    decodeURIComponent(mt[1]).split(',').forEach(spec => {
+      const q = spec.split('|');
+      if (!q[0]) return;
+      const e = { urls: q[0].trim() };
+      if (q[1]) e.username = q[1].trim();
+      if (q[2]) e.credential = q[2].trim();
+      list.push(e);
+    });
+  }
+  return list;
+}
+function hasTurn(){ return iceServers().some(e => /^turns?:/.test(e.urls)); }
+
 /* ── PeerJS(WebRTC) 전송 — 호스트는 최대 3명을 동시에 받는다 ── */
 let peerLibPromise = null;
 function loadPeerLib(){
@@ -1157,9 +1187,21 @@ function PeerTransport(){
   let peer = null, isHost = false, cb = {};
   const conns = new Map();          // peerId → DataConnection
   const banned = new Set();         // 강제 퇴장당한 peerId (이 방이 열려 있는 동안)
+  let joinTimer = null;             // 클라이언트 연결 감시 타이머
+  let iceState = '';                // 마지막 ICE 상태 (진단 표시용)
+  function watchIce(c){
+    // PeerJS 는 협상이 시작돼야 peerConnection 을 만든다 — 잠시 뒤부터 상태를 읽는다
+    const t = setInterval(() => {
+      const pc = c && c.peerConnection;
+      if (pc){ iceState = pc.iceConnectionState || ''; if (/connected|completed|failed|closed/.test(iceState)) clearInterval(t); }
+    }, 500);
+    setTimeout(() => clearInterval(t), 40000);
+  }
   function bind(c){
     const id = c.peer;
-    c.on('open', () => { conns.set(id, c); cb.onOpen && cb.onOpen(id); });
+    watchIce(c);
+    c.on('open', () => { if (joinTimer){ clearTimeout(joinTimer); joinTimer = null; }
+                         conns.set(id, c); cb.onOpen && cb.onOpen(id); });
     c.on('data', d => cb.onData && cb.onData(id, d));
     c.on('close', () => { conns.delete(id); cb.onClose && cb.onClose(id); });
     c.on('error', () => { conns.delete(id); cb.onClose && cb.onClose(id); });
@@ -1170,18 +1212,30 @@ function PeerTransport(){
       isHost = host; cb = handlers;
       loadPeerLib().then(() => {
         // ?peer=host:port[:/path] 로 자체 PeerServer 지정 가능 (공개 브로커가 막힌 망 대비)
-        let opts;
+        const opts = { config: { iceServers: iceServers(), sdpSemantics: 'unified-plan' } };
         const mp = /[?&]peer=([^&]+)/.exec(location.search);
         if (mp){
           const parts = decodeURIComponent(mp[1]).split(':');
-          opts = { host: parts[0], port: parts[1] ? parseInt(parts[1],10) : 443,
-                   path: parts[2] ? ('/' + parts[2].replace(/^\//,'')) : '/',
-                   secure: location.protocol === 'https:' };
+          opts.host = parts[0];
+          opts.port = parts[1] ? parseInt(parts[1],10) : 443;
+          opts.path = parts[2] ? ('/' + parts[2].replace(/^\//,'')) : '/';
+          opts.secure = location.protocol === 'https:';
         }
         peer = isHost ? new Peer(ROOM_NS + room, opts) : new Peer(undefined, opts);
         peer.on('open', () => {
           cb.onReady && cb.onReady(room);
-          if (!isHost) bind(peer.connect(ROOM_NS + room, { reliable: true }));
+          if (!isHost){
+            bind(peer.connect(ROOM_NS + room, { reliable: true }));
+            // ★ 조용한 실패를 막는다 — 방은 찾았는데 P2P 경로가 안 뚫리면
+            //   예전에는 "연결 중..." 상태로 영원히 멈춰 있었다.
+            joinTimer = setTimeout(() => {
+              joinTimer = null;
+              if (conns.size) return;
+              cb.onError && cb.onError(hasTurn()
+                ? ('릴레이로도 연결되지 않았습니다 (ICE: ' + (iceState || '대기') + ')')
+                : '방은 찾았지만 직접 연결이 안 됩니다 — 회선이 P2P를 막고 있습니다 (README의 TURN 설정 참고)');
+            }, 15000);
+          }
         });
         if (isHost) peer.on('connection', c => {
           if (banned.has(c.peer)){
@@ -1212,7 +1266,9 @@ function PeerTransport(){
               setTimeout(() => { try { c.close(); } catch(e){} }, 300); }
       conns.delete(id);
     },
+    get ice(){ return iceState; },
     close(){
+      if (joinTimer){ clearTimeout(joinTimer); joinTimer = null; }
       conns.forEach(c => { try { c.close(); } catch(e){} });
       conns.clear(); banned.clear();
       try { if (peer) peer.destroy(); } catch(e){}
@@ -1323,7 +1379,16 @@ const Net = {
           if (G && (state === S.PLAY || state === S.PAUSE)) G.netDropped = true;
         }
       },
-      onError: (m) => { this.error = m; this.status = ''; },
+      onError: (m) => {
+        this.error = m; this.status = '';
+        // 아직 아무도 못 붙은 상태의 실패라면 대기실에 갇히지 않게 모드 선택으로 되돌린다
+        if (!this.connected){
+          this.close();
+          this.error = m;
+          lobbyRole = ''; joinCode = '';
+          if (state === S.LOBBY) state = S.MODE;
+        }
+      },
       onKicked: () => this.beKicked(),
     });
   },
@@ -3702,6 +3767,20 @@ function drawTitle(t){
    모드 선택 · 대기실
    ═══════════════════════════════════════════════════ */
 const uiBtns = [];   // {x,y,w,h,id}
+// 긴 안내문을 폭에 맞춰 줄바꿈해서 그린다 (연결 실패 안내가 화면 밖으로 나가지 않게)
+function drawWrap(text, cx, y, maxW, lineH){
+  const words = String(text).split(' ');
+  let line = '', n = 0;
+  for (let i=0;i<words.length;i++){
+    const t = line ? (line + ' ' + words[i]) : words[i];
+    if (ctx.measureText(t).width > maxW && line){
+      ctx.fillText(line, cx, y + n*lineH); n++; line = words[i];
+    } else line = t;
+  }
+  if (line) ctx.fillText(line, cx, y + n*lineH);
+  return n + 1;
+}
+
 function btn(x, y, w, h, id, label, sub, on, col){
   uiBtns.push({ x, y, w, h, id });
   ctx.save();
@@ -3729,6 +3808,7 @@ let joinCode = '';       // 참가 코드 입력 버퍼
 let lobbyRole = '';      // 'host' | 'client'
 // 강제 퇴장은 두 번 눌러야 실행된다 (오조작 방지). 2초 안에 다시 누르지 않으면 풀린다.
 let kickArm = { slot: -1, until: 0 };
+let lobbyWait = 0;       // 클라이언트가 연결을 기다린 프레임 수 (경과 표시용)
 
 function drawModeSelect(t){
   drawBackground(t);
@@ -3750,7 +3830,12 @@ function drawModeSelect(t){
   if (Net.error){
     ctx.save(); ctx.textAlign='center'; ctx.fillStyle = '#ff6b6b';
     ctx.font = '11px Menlo, monospace';
-    ctx.fillText(Net.error, LW/2, 534);
+    const n = drawWrap(Net.error, LW/2, 528, 380, 14);
+    if (/직접 연결|릴레이/.test(Net.error)){
+      ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '10px Menlo, monospace';
+      drawWrap('둘 다 다른 네트워크(회사·학교·모바일)면 흔한 일입니다. README의 "연결이 안 될 때" 를 보세요',
+               LW/2, 528 + n*14 + 4, 400, 13);
+    }
     ctx.restore();
   }
   ctx.save(); ctx.textAlign='center'; ctx.fillStyle = C.dim;
@@ -3851,7 +3936,11 @@ function drawLobby(t){
 
   ctx.textAlign = 'center';
   ctx.font = '11px Menlo, monospace'; ctx.fillStyle = Net.error ? '#ff6b6b' : C.dim;
-  ctx.fillText(Net.error || Net.status, LW/2, 400);
+  let line = Net.error || Net.status;
+  if (!Net.error && !Net.connected && !Net.isHost() && lobbyWait > 0){
+    line = Net.status + '  (' + Math.floor(lobbyWait/60) + '초)';   // 멈춘 게 아니라는 표시
+  }
+  drawWrap(line, LW/2, 400, 380, 14);
   ctx.restore();
 
   const canStart = Net.allReady();
@@ -4137,6 +4226,7 @@ function loop(now){
   } else if (state === S.MODE){
     drawModeSelect(frame);
   } else if (state === S.LOBBY){
+    if (Net.isOnline() && !Net.isHost() && !Net.connected) lobbyWait++; else lobbyWait = 0;
     if (lobbyRole === 'joininput') drawJoinInput(frame); else drawLobby(frame);
   } else {
     ctx.save();
@@ -4287,6 +4377,7 @@ window.__game = {
                       myReady: Net.me() ? Net.me().ready : false,
                       status: Net.status, error: Net.error, lobbyRole,
                       kickArm: kickArm.slot,
+                      ice: (Net.tp && Net.tp.ice) || '', hasTurn: hasTurn(),
                       players: Net.players.map(p => ({ slot: p.slot, present: p.present, ready: p.ready,
                                 x: Math.round(p.x), y: Math.round(p.y),
                                 lives: p.lives, power: +p.power.toFixed(2),
