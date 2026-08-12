@@ -1278,6 +1278,94 @@ function PeerTransport(){
   };
 }
 
+/* ── WebSocket 릴레이 전송 ──
+   P2P(WebRTC)는 양쪽 회선이 서로 뚫려야 붙는다. 회사·학교망처럼 NAT이 까다로우면
+   TURN 릴레이 없이는 아예 연결되지 않는다. 그래서 "게임 데이터를 통째로 중계하는
+   서버"를 하나 띄우는 길을 열어 뒀다 — 이건 그냥 바깥으로 나가는 WebSocket 하나라
+   NAT을 탈 일이 없다. (server.js + cloudflared 로 2분이면 띄운다. README 참고)
+
+   프레임 규약 — 게임 → 서버
+     binary : [to(1B, 255=broadcast)][payload...]
+     text   : {"to": n|null, "d": {...}}
+   서버 → 게임 (서버가 보낸 사람 번호로 바꿔 준다)
+     binary : [from(1B)][payload...]
+     text   : {"from": n, "d": {...}}                                       */
+function WSTransport(url){
+  let ws = null, isHost = false, cb = {}, myId = -1, peerIds = [], opened = false;
+  let refused = false;   // 서버가 거절 사유를 이미 알려준 경우 (닫힘 메시지로 덮어쓰지 않는다)
+  const sid = n => 'p' + n;
+  function ctrl(o){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+  return {
+    kind: 'ws',
+    open(room, host, handlers){
+      isHost = host; cb = handlers; refused = false; opened = false;
+      try { ws = new WebSocket(url); }
+      catch(e){ cb.onError && cb.onError('릴레이 주소가 잘못되었습니다'); return; }
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => ctrl({ sys:'join', room, host: !!host });
+      ws.onerror = () => { if (!opened && !refused) cb.onError && cb.onError('릴레이 서버에 연결하지 못했습니다'); };
+      ws.onclose = () => {
+        if (refused) return;
+        if (!opened){ cb.onError && cb.onError('릴레이 서버와 연결이 끊겼습니다'); return; }
+        peerIds.slice().forEach(id => cb.onClose && cb.onClose(id));
+        peerIds = [];
+      };
+      ws.onmessage = (e) => {
+        if (typeof e.data !== 'string'){
+          const b = new Uint8Array(e.data);
+          cb.onData && cb.onData(sid(b[0]), e.data.slice(1));
+          return;
+        }
+        let m; try { m = JSON.parse(e.data); } catch(_){ return; }
+        if (m.sys === 'id'){
+          opened = true; myId = m.id;
+          cb.onReady && cb.onReady(room);
+          if (!isHost){ peerIds = [sid(m.hostId)]; cb.onOpen && cb.onOpen(sid(m.hostId)); }
+        }
+        else if (m.sys === 'open'){ peerIds.push(sid(m.id)); cb.onOpen && cb.onOpen(sid(m.id)); }
+        else if (m.sys === 'close'){
+          peerIds = peerIds.filter(x => x !== sid(m.id));
+          cb.onClose && cb.onClose(sid(m.id));
+        }
+        else if (m.sys === 'full'){ refused = true; cb.onError && cb.onError('방이 가득 찼습니다 (최대 4인)'); }
+        else if (m.sys === 'nohost'){ refused = true; cb.onError && cb.onError('방을 찾을 수 없습니다'); }
+        else if (m.sys === 'taken'){ refused = true; cb.onError && cb.onError('이미 사용 중인 방 코드입니다'); }
+        else if (m.sys === 'kicked'){ refused = true; cb.onKicked && cb.onKicked(); }
+        else if (m.from !== undefined){ cb.onData && cb.onData(sid(m.from), m.d); }
+      };
+    },
+    send(to, d){
+      if (!ws || ws.readyState !== 1) return;
+      const n = (typeof to === 'string' && to[0] === 'p') ? parseInt(to.slice(1), 10) : 255;
+      if (d instanceof ArrayBuffer){
+        const src = new Uint8Array(d), out = new Uint8Array(src.length + 1);
+        out[0] = n; out.set(src, 1); ws.send(out.buffer);
+      } else ws.send(JSON.stringify({ to: n, d }));
+    },
+    broadcast(d){
+      if (!ws || ws.readyState !== 1) return;
+      if (d instanceof ArrayBuffer){
+        const src = new Uint8Array(d), out = new Uint8Array(src.length + 1);
+        out[0] = 255; out.set(src, 1); ws.send(out.buffer);
+      } else ws.send(JSON.stringify({ to: null, d }));
+    },
+    drop(id){
+      const n = (typeof id === 'string' && id[0] === 'p') ? parseInt(id.slice(1), 10) : -1;
+      if (n >= 0) ctrl({ sys:'drop', id: n });
+      peerIds = peerIds.filter(x => x !== id);
+    },
+    get ice(){ return 'relay'; },
+    close(){
+      // 핸들러부터 떼어낸다 — 안 그러면 '방이 가득 찼습니다' 같은 사유가
+      // 뒤따라오는 onclose 메시지에 덮여 버린다
+      if (ws){ ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null;
+               try { ws.close(); } catch(e){} ws = null; }
+      peerIds = []; opened = false;
+    },
+    get peers(){ return peerIds.slice(); },
+  };
+}
+
 /* ── 슬롯 하나 = 플레이어 한 명 ── */
 function makeSlot(i){
   return {
@@ -1344,7 +1432,9 @@ const Net = {
       const me = this.players[0];
       me.present = true; me.peerId = 'me';
     }
-    const TP = (transportKind === 'bc') ? BCTransport : PeerTransport;
+    const TP = (transportKind === 'bc') ? BCTransport
+             : (transportKind === 'ws') ? (() => WSTransport(wsRelayUrl))
+             : PeerTransport;
     this.tp = TP();
     this.tp.open(room, kind === 'host', {
       onReady: () => { this.status = kind === 'host' ? '상대를 기다리는 중' : '연결 중...'; },
@@ -3802,8 +3892,22 @@ function btn(x, y, w, h, id, label, sub, on, col){
   ctx.restore();
 }
 
+/* 릴레이 주소 결정
+   - server.js 가 서빙하면 자기 오리진의 /ws 를 쓴다 (참가자는 주소만 열면 끝)
+   - 다른 곳에 올린 파일이면 ?ws=wss://주소/ws 로 직접 지정 */
+const wsRelayUrl = (function(){
+  if (typeof location === 'undefined') return '';
+  const m = /[?&]ws=([^&]+)/.exec(location.search);
+  const auto = () => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  if (m){
+    const u = decodeURIComponent(m[1]);
+    return (u === '1' || u === 'auto') ? auto() : u;
+  }
+  if (typeof window !== 'undefined' && window.__NEOTONE_WS) return auto();
+  return '';
+})();
 let netTransportKind = (typeof location !== 'undefined' &&
-  /[?&]net=bc/.test(location.search)) ? 'bc' : 'peer';
+  /[?&]net=bc/.test(location.search)) ? 'bc' : (wsRelayUrl ? 'ws' : 'peer');
 let joinCode = '';       // 참가 코드 입력 버퍼
 let lobbyRole = '';      // 'host' | 'client'
 // 강제 퇴장은 두 번 눌러야 실행된다 (오조작 방지). 2초 안에 다시 누르지 않으면 풀린다.
@@ -3889,6 +3993,11 @@ function drawLobby(t){
   ctx.font = '10px Menlo, monospace'; ctx.fillStyle = C.dim;
   ctx.fillText(Net.isHost() ? '이 코드를 친구에게 알려주세요  (최대 4인)'
                             : '방장이 시작하면 함께 출격합니다', LW/2, 178);
+  // 어떤 경로로 붙어 있는지 알려준다 (연결 문제를 물어볼 때 이 한 줄이면 판별된다)
+  if (Net.tp && Net.tp.kind === 'ws'){
+    ctx.fillStyle = '#5cff9e'; ctx.font = '9px Menlo, monospace';
+    ctx.fillText('릴레이 서버 경유 — NAT 걱정 없음', LW/2, 192);
+  }
 
   // 4 슬롯
   for (let i=0;i<MAX_PLAYERS;i++){
@@ -4378,6 +4487,7 @@ window.__game = {
                       status: Net.status, error: Net.error, lobbyRole,
                       kickArm: kickArm.slot,
                       ice: (Net.tp && Net.tp.ice) || '', hasTurn: hasTurn(),
+                      transport: (Net.tp && Net.tp.kind) || '', relay: wsRelayUrl,
                       players: Net.players.map(p => ({ slot: p.slot, present: p.present, ready: p.ready,
                                 x: Math.round(p.x), y: Math.round(p.y),
                                 lives: p.lives, power: +p.power.toFixed(2),
