@@ -43,10 +43,10 @@ const laneX = i => ROAD.x + LANE_W * (i + 0.5);
 //    브레이크는 없다. 가속 페달만 있고, 떼면 기본 속도로 서서히 돌아온다.
 //    그래서 "속도를 죽여 시간을 버는" 선택지가 없고, 위험은 핸들로만 푼다.
 //    대신 가속은 순수한 욕심 — 추월이 늘지만 닫히는 속도도 같이 커진다.
-const SPD_BASE = 6.0, SPD_MAX = 14.5, SPD_START = SPD_BASE;
+const SPD_BASE = 7.0, SPD_MAX = 15.0, SPD_START = SPD_BASE;
 const SPD_MIN = SPD_BASE;                  // 이 아래로는 내려가지 않는다
 const ACCEL = 0.090, COAST = 0.040;        // COAST = 페달 뗐을 때 기본 속도로 복귀
-const KMH = 18;                            // 표시용 환산 (기본 108 / 최고 261 km/h)
+const KMH = 16;                            // 표시용 환산 (기본 112 / 최고 240 km/h)
 
 const PLAYER = { w: 32, h: 56, y: LH - 150 };
 const HIT_INSET_X = 3, HIT_INSET_Y = 5;    // 판정은 스프라이트보다 살짝 안쪽
@@ -60,9 +60,9 @@ function inGas(x, y){ const dx = x - GAS.x, dy = y - GAS.y; return dx*dx + dy*dy
 /* ── 난이도 일정 (초 단위) ─────────────────────────────────
    요청하신 순서: 교통량·상대속도 → 앞 차 차선 변경 → 역주행
    "짧고 빠른 이동"을 만드는 장치로 밀집 편성(차량 벽)을 함께 넣었다. */
-const T_LANECHANGE = 12;    // 차선 변경 NPC 등장
-const T_WALL       = 20;    // 차량 벽(틈 하나) 편성 등장
-const T_ONCOMING   = 30;    // 역주행 등장
+const T_LANECHANGE = 7;     // 차선 변경 NPC 등장
+const T_WALL       = 14;    // 차량 벽(틈 하나) 편성 등장
+const T_ONCOMING   = 22;    // 역주행 등장
 
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d', { alpha: false });
@@ -343,7 +343,7 @@ for (let i=0;i<MAX_CAR;i++) cars.push({
   on:false, x:0, y:0, w:32, h:56, spd:0, lane:0, kind:'npc', spr:null,
   passed:false, nearMissed:false,
   // 차선 변경
-  changing:false, targetX:0, blinker:0, changeSpd:0,
+  changing:false, targetX:0, blinker:0, changeSpd:0, flee:false,
 });
 function spawnCar(){
   for (let i=0;i<MAX_CAR;i++) if (!cars[i].on) return cars[i];
@@ -392,11 +392,12 @@ function newRun(){
     overtakes: 0,
     nearMiss: 0,
     dist: 0,
-    spawnTick: 30,
+    spawnTick: 8,
     wallTick: 0,
     oncTick: 0,
     banner: 0, bannerText: '',
     oncWarn: null,
+    oncLane: -1,           // 역주행이 오는 차선 (정주행 스폰 금지)
     newBest: false,
     finished: false,
   };
@@ -416,17 +417,21 @@ const sec = () => G.time / 60;
    ═══════════════════════════════════════════════════ */
 function diff(){
   const t = sec();
-  const ramp = Math.min(1, t / 70);                      // 0→1 (70초에 최대)
+  // 램프를 0 이 아니라 0.25 에서 시작한다 — 시작 직후부터 차가 제법 있어야 한다.
+  // 최대치 도달도 55초로 당겼다.
+  const ramp = Math.min(1, 0.25 + t / 55);
   return {
     // 교통량: 스폰 간격이 좁아진다
-    interval: Math.round(44 - 30 * ramp),                // 44 → 14 프레임
+    interval: Math.round(40 - 27 * ramp),                // 시작 33 → 최소 13 프레임
     // 상대 속도: 느린 차가 조금씩 빨라져 추월 여유가 줄어든다
-    npcMin: 2.9 + 1.7 * ramp,
-    npcMax: 5.4 + 2.6 * ramp,
-    truckChance: 0.16 + 0.10 * ramp,
-    laneChange: t < T_LANECHANGE ? 0 : Math.min(0.50, 0.14 + (t - T_LANECHANGE) / 70),
-    wallEvery: t < T_WALL ? 1e9 : Math.max(190, 460 - (t - T_WALL) * 5.0),
-    oncEvery:  t < T_ONCOMING ? 1e9 : Math.max(120, 330 - (t - T_ONCOMING) * 4.2),
+    // 순항(7.0) 보다 느려야 기본 속도로도 계속 추월이 일어난다.
+    // 후반에는 최고 속도가 순항에 붙어서, 추월하려면 가속을 밟아야 한다.
+    npcMin: 2.8 + 1.6 * ramp,                            // 3.2 → 4.4
+    npcMax: 4.6 + 2.4 * ramp,                            // 5.2 → 7.0
+    truckChance: 0.18 + 0.10 * ramp,
+    laneChange: t < T_LANECHANGE ? 0 : Math.min(0.52, 0.18 + (t - T_LANECHANGE) / 55),
+    wallEvery: t < T_WALL ? 1e9 : Math.max(170, 400 - (t - T_WALL) * 5.5),
+    oncEvery:  t < T_ONCOMING ? 1e9 : Math.max(110, 300 - (t - T_ONCOMING) * 4.6),
     ramp,
   };
 }
@@ -434,22 +439,89 @@ function diff(){
 /* ═══════════════════════════════════════════════════
    스폰
    ═══════════════════════════════════════════════════ */
+// 어떤 차가 lane 으로 들어가도 안전한가 (차선 변경 판단용)
+function laneClearFor(c, lane){
+  const tx = laneX(lane);
+  for (let j=0;j<MAX_CAR;j++){
+    const a = cars[j];
+    if (!a.on || a === c) continue;
+    if (Math.abs(a.x - tx) >= (a.w + c.w) * 0.5 + 8) continue;
+    if (Math.abs(a.y - c.y) < (a.h + c.h) * 0.5 + 46) return false;
+  }
+  return true;
+}
+
+// 같은 방향 차량끼리 겹치지 않게 한다.
+// 뒤차가 앞차보다 빠르면 앞차 속도로 수렴시키고, 그래도 붙으면 물리적으로 밀어낸다.
+// 이게 없으면 같은 차선에서 속도 차이만큼 그대로 겹쳐 지나간다.
+function trafficAvoid(){
+  for (let i=0;i<MAX_CAR;i++){
+    const b = cars[i];
+    if (!b.on || b.kind === 'onc') continue;
+    let lead = null, bestGap = 1e9;
+    for (let j=0;j<MAX_CAR;j++){
+      if (j === i) continue;
+      const a = cars[j];
+      if (!a.on || a.kind === 'onc') continue;
+      if (a.y >= b.y) continue;                                    // 앞(위)에 있는 차만
+      if (Math.abs(a.x - b.x) >= (a.w + b.w) * 0.5 + 2) continue;  // 같은 폭에 걸린 차만
+      const gap = (b.y - a.y) - (a.h + b.h) * 0.5;
+      if (gap < bestGap){ bestGap = gap; lead = a; }
+    }
+    if (!lead) continue;
+    if (bestGap < 95 && b.spd > lead.spd) b.spd = Math.max(lead.spd, b.spd - 0.22);
+    if (bestGap < 3){                                              // 겹치기 직전 — 밀어낸다
+      b.y = lead.y + (lead.h + b.h) * 0.5 + 3;
+      b.spd = lead.spd;
+    }
+  }
+}
+
+// 정면(역주행)과 겹치는 정주행 차가 남았으면 급하게 옆으로 뺀다.
+// 위 장치들로 거의 안 생기지만, 생겼을 때 겹쳐 보이지 않게 하는 마지막 안전망이다.
+function oncAvoid(){
+  for (let i=0;i<MAX_CAR;i++){
+    const o = cars[i];
+    if (!o.on || o.kind !== 'onc') continue;
+    for (let j=0;j<MAX_CAR;j++){
+      const c = cars[j];
+      if (!c.on || c.kind === 'onc') continue;
+      if (Math.abs(c.x - o.x) >= (c.w + o.w) * 0.5 + 10) continue;
+      if (Math.abs(c.y - o.y) >= (c.h + o.h) * 0.5 + 70) continue;
+      const dir = (c.x < ROAD.x + ROAD.w - LANE_W) ? 1 : -1;
+      c.x += dir * 3.2;
+      c.x = Math.max(ROAD.x + c.w*0.5 + 2, Math.min(ROAD.x + ROAD.w - c.w*0.5 - 2, c.x));
+      c.changing = false; c.pendingLane = -1; c.blinker = 1;
+      if (frame % 6 === 0) spawnPart(c.x, c.y + c.h*0.4, dir*0.6, 1.4, 12, 'rgba(230,235,240,', 2);
+    }
+  }
+}
+
 function laneFree(lane, y, h){
   for (let i=0;i<MAX_CAR;i++){
     const c = cars[i];
     if (!c.on) continue;
     if (Math.abs(c.x - laneX(lane)) > LANE_W * 0.7) continue;
-    if (y - h*0.5 < c.y + c.h*0.5 + 70 && y + h*0.5 > c.y - c.h*0.5 - 70) return false;
+    if (y - h*0.5 < c.y + c.h*0.5 + 42 && y + h*0.5 > c.y - c.h*0.5 - 42) return false;
   }
   return true;
 }
 
 function spawnTraffic(d){
-  const lane = Math.floor(Math.random() * LANES);
   const isTruck = Math.random() < d.truckChance;
   const h = isTruck ? 88 : 56;
   const y = -h - 20;
-  if (!laneFree(lane, y, h)) return;
+
+  // 차선 하나가 막혔다고 이 틱을 버리지 않는다 — 최대 3곳을 시도한다.
+  // (막힌 차선만 뽑아서 스폰이 계속 취소되면 밀도가 오르지 않는다)
+  let lane = -1;
+  for (let k = 0; k < 3; k++){
+    let l = Math.floor(Math.random() * LANES);
+    if (l === G.oncLane) l = (l + 1 + Math.floor(Math.random() * (LANES - 1))) % LANES;
+    if (l === G.oncLane) continue;
+    if (laneFree(l, y, h)){ lane = l; break; }
+  }
+  if (lane < 0) return;
   const c = spawnCar(); if (!c) return;
   c.on = true; c.lane = lane; c.x = laneX(lane); c.y = y;
   c.kind = isTruck ? 'truck' : 'npc';
@@ -464,17 +536,20 @@ function spawnTraffic(d){
   // 차선 변경 예정?
   if (!isTruck && Math.random() < d.laneChange){
     const dir = (lane === 0) ? 1 : (lane === LANES-1) ? -1 : (Math.random() < 0.5 ? -1 : 1);
-    c.pendingLane = lane + dir;
+    const want = lane + dir;
+    c.pendingLane = (want === G.oncLane) ? -1 : want;
     c.pendingAt = 30 + Math.floor(Math.random() * 60);
   } else c.pendingLane = -1;
 }
 
 // 차량 벽 — 한 차선만 비운다. 속도를 죽이고 그 틈으로 들어가야 한다.
 function spawnWall(d){
-  const gap = Math.floor(Math.random() * LANES);
+  // 역주행이 오는 차선이 있으면 그 차선을 통로로 삼는다 (벽이 정면 관통을 만들지 않게)
+  const gap = (G.oncLane >= 0) ? G.oncLane : Math.floor(Math.random() * LANES);
   const y = -170;
   for (let l=0;l<LANES;l++){
     if (l === gap) continue;
+    if (l === G.oncLane) continue;
     if (!laneFree(l, y, 56)) continue;
     const c = spawnCar(); if (!c) continue;
     c.on = true; c.lane = l; c.x = laneX(l); c.y = y - Math.random()*14;
@@ -490,12 +565,55 @@ function spawnWall(d){
 // 역주행 예고 — 실제 차보다 먼저 차선을 붉게 경고한다.
 // 닫히는 속도가 초당 ~16px(=960px/s) 이라 예고 없이 내보내면 반응 시간이 0.6초뿐이다.
 // 예고 45프레임(0.75초) + 진입 후 주행 시간까지 합쳐 약 1.5초를 준다.
+// 역주행이 들어갈 차선은 정주행 차가 가장 적은 쪽을 고른다.
+function pickOncLane(){
+  let best = 0, bestN = 1e9;
+  for (let l=0;l<2;l++){
+    let n = 0;
+    for (let i=0;i<MAX_CAR;i++){
+      const c = cars[i];
+      if (!c.on || c.kind === 'onc') continue;
+      if (Math.abs(c.x - laneX(l)) > LANE_W * 0.6) continue;
+      if (c.y > player.y + 60) continue;          // 이미 지나간 차는 셈에서 뺀다
+      n++;
+    }
+    if (n < bestN){ bestN = n; best = l; }
+  }
+  return best;
+}
+
 function warnOncoming(){
-  const lane = Math.floor(Math.random() * 2);
-  G.oncWarn = { lane, t: 45 };
+  const lane = pickOncLane();
+  G.oncWarn = { lane, t: 60, tries: 0 };
+  G.oncLane = lane;
+  // 그 차선에 있던 정주행 차들은 옆으로 피한다 (역주행을 피하는 것처럼 읽힌다)
+  for (let i=0;i<MAX_CAR;i++){
+    const c = cars[i];
+    if (!c.on || c.kind === 'onc') continue;
+    if (Math.abs(c.x - laneX(lane)) > LANE_W * 0.6) continue;
+    const alt = (lane + 1 < LANES) ? lane + 1 : lane - 1;
+    if (laneClearFor(c, alt)){
+      c.changing = true; c.flee = true;
+      c.targetX = laneX(alt);
+      c.changeSpd = (c.targetX > c.x) ? 1.0 : -1.0;
+      c.lane = alt; c.pendingLane = -1; c.blinker = 1;
+    }
+  }
   G.banner = 70; G.bannerText = '⚠ 역주행';
   Sound.blip(300, 0.12, 'square', 0.10);
   setTimeout(()=>Sound.blip(300, 0.12, 'square', 0.10), 220);
+}
+
+// 역주행 차선이 정주행 차 없이 비어 있는가 (플레이어 앞쪽까지)
+function oncLaneClear(lane){
+  const lx = laneX(lane);
+  for (let i=0;i<MAX_CAR;i++){
+    const c = cars[i];
+    if (!c.on || c.kind === 'onc') continue;
+    if (Math.abs(c.x - lx) > (c.w + 32) * 0.5 + 4) continue;
+    if (c.y < player.y + 80) return false;        // 앞쪽에 아직 차가 있다
+  }
+  return true;
 }
 
 // 역주행 — 마주 달려온다. 체감 속도가 두 배.
@@ -582,7 +700,17 @@ function updateWorld(){
   if (G.oncTick >= d.oncEvery && !G.oncWarn){ warnOncoming(); G.oncTick = 0; }
   if (G.oncWarn){
     G.oncWarn.t--;
-    if (G.oncWarn.t <= 0){ spawnOncoming(d, G.oncWarn.lane); G.oncWarn = null; }
+    if (G.oncWarn.t <= 0){
+      // 아직 그 차선에 정주행 차가 남아 있으면 내보내지 않는다.
+      // 겹쳐 지나가는 것보다 이번 역주행을 건너뛰는 편이 낫다.
+      if (oncLaneClear(G.oncWarn.lane)){
+        spawnOncoming(d, G.oncWarn.lane); G.oncWarn = null;
+      } else if (G.oncWarn.tries < 3){
+        G.oncWarn.tries++; G.oncWarn.t = 24;      // 조금 더 기다린다
+      } else {
+        G.oncWarn = null; G.oncLane = -1;         // 포기 — 다음 기회에
+      }
+    }
   }
 
   // 차량 이동
@@ -593,19 +721,34 @@ function updateWorld(){
     // 상대 속도 = 내 속도 - 상대 속도.  역주행(음수)이면 더해져서 훨씬 빠르게 다가온다.
     c.y += (player.spd - c.spd);
 
-    // 차선 변경 예약 처리
+    // 차선 변경 예약 처리 — 옆 차선이 비었을 때만 들어간다
     if (c.pendingLane >= 0){
       c.pendingAt--;
       if (c.pendingAt <= 0){
-        c.changing = true; c.targetX = laneX(c.pendingLane);
-        c.changeSpd = (c.targetX > c.x) ? 1.0 : -1.0;
-        c.lane = c.pendingLane; c.pendingLane = -1; c.blinker = 1;
+        if (c.pendingLane === G.oncLane){ c.pendingLane = -1; c.blinker = 0; }
+        else if (laneClearFor(c, c.pendingLane)){
+          c.changing = true; c.targetX = laneX(c.pendingLane);
+          c.changeSpd = (c.targetX > c.x) ? 1.0 : -1.0;
+          c.lane = c.pendingLane; c.pendingLane = -1; c.blinker = 1;
+        } else {
+          c.pendingAt = 24;              // 막혔다 — 잠시 뒤 다시 시도
+        }
       } else if (c.pendingAt < 40) c.blinker = 1;      // 미리 깜빡인다 (예고)
     }
     if (c.changing){
-      c.x += c.changeSpd * 1.15;
+      // 이동 중에도 목표 지점이 막히면 그 프레임은 멈춘다 (옆구리 관통 방지)
+      const step = c.changeSpd * (c.flee ? 2.1 : 1.15);
+      const nx = c.x + step;
+      let blocked = false;
+      for (let j=0;j<MAX_CAR;j++){
+        const a = cars[j];
+        if (!a.on || a === c || a.kind === 'onc') continue;
+        if (Math.abs(a.x - nx) < (a.w + c.w) * 0.5 + 1 &&
+            Math.abs(a.y - c.y) < (a.h + c.h) * 0.5 + 2){ blocked = true; break; }
+      }
+      if (!blocked) c.x = nx;
       if ((c.changeSpd > 0 && c.x >= c.targetX) || (c.changeSpd < 0 && c.x <= c.targetX)){
-        c.x = c.targetX; c.changing = false; c.blinker = 0;
+        c.x = c.targetX; c.changing = false; c.blinker = 0; c.flee = false;
       }
     }
 
@@ -628,6 +771,17 @@ function updateWorld(){
     }
 
     if (c.y > LH + 120 || c.y < -400) c.on = false;
+  }
+
+  // 같은 방향 차량끼리 겹치지 않게 정리 (이동 뒤에 한 번)
+  trafficAvoid();
+  oncAvoid();
+
+  // 역주행이 전부 지나갔으면 그 차선을 다시 열어 준다
+  if (G.oncLane >= 0 && !G.oncWarn){
+    let stillThere = false;
+    for (let i=0;i<MAX_CAR;i++) if (cars[i].on && cars[i].kind === 'onc'){ stillThere = true; break; }
+    if (!stillThere) G.oncLane = -1;
   }
 
   // 배경 소품
@@ -1165,6 +1319,19 @@ window.__race = {
   get best(){ return bestTime; },
   get lastRun(){ return lastRun; },
   get gas(){ return { on: Input.gas || Input.up, box: GAS }; },
+  // 겹친 차량 쌍 수 — 관통 검증용. 0 이어야 한다.
+  get overlaps(){
+    const out = [];
+    for (let i=0;i<MAX_CAR;i++){
+      const a = cars[i]; if (!a.on) continue;
+      for (let j=i+1;j<MAX_CAR;j++){
+        const b = cars[j]; if (!b.on) continue;
+        if (Math.abs(a.x-b.x) < (a.w+b.w)*0.5 - 2 && Math.abs(a.y-b.y) < (a.h+b.h)*0.5 - 2)
+          out.push({ a:a.kind, b:b.kind, dx:Math.round(Math.abs(a.x-b.x)), dy:Math.round(Math.abs(a.y-b.y)) });
+      }
+    }
+    return out;
+  },
   get kinds(){ const o = {npc:0,truck:0,onc:0,changing:0};
     for (let i=0;i<MAX_CAR;i++){ const c = cars[i]; if (!c.on) continue;
       o[c.kind]++; if (c.changing || c.pendingLane >= 0) o.changing++; }
