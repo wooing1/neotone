@@ -3910,7 +3910,12 @@ function btn(x, y, w, h, id, label, sub, on, col){
 const wsRelayUrl = (function(){
   if (typeof location === 'undefined') return '';
   const m = /[?&]ws=([^&]+)/.exec(location.search);
-  const auto = () => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  // 서브경로로 서빙될 수도 있다 (nginx 로 /neotone/ 아래에 붙이는 경우).
+  // 그래서 현재 페이지의 디렉터리를 기준으로 /ws 를 붙인다.
+  const auto = () => {
+    const dir = location.pathname.replace(/[^/]*$/, '');      // /neotone/index.html → /neotone/
+    return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + dir + 'ws';
+  };
   if (m){
     const u = decodeURIComponent(m[1]);
     return (u === '1' || u === 'auto') ? auto() : u;

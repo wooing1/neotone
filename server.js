@@ -28,7 +28,14 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = parseInt(process.argv[2], 10) || 9000;
+// 바인딩 주소. nginx 뒤에 둘 때는 127.0.0.1 로 묶어서 바깥에 직접 노출되지 않게 한다.
+//   node server.js 9000 127.0.0.1
+const BIND = process.argv[3] || process.env.NEOTONE_BIND || '0.0.0.0';
 const MAX_PLAYERS = 4;
+// 공개 서버에 올려도 견디도록 한도를 둔다 (인증 없는 릴레이라서)
+const MAX_SOCKETS = parseInt(process.env.NEOTONE_MAX_SOCKETS || '64', 10);
+const MAX_ROOMS   = parseInt(process.env.NEOTONE_MAX_ROOMS   || '16', 10);
+let sockCount = 0;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';   // RFC 6455
 
 /* ── index.html 서빙 (릴레이 사용 표시를 끼워 넣는다) ── */
@@ -43,9 +50,13 @@ function pageHtml(){
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/health'){
+  if (/favicon\.ico$/.test(req.url || '')){   // 콘솔에 404 가 남지 않게
+    res.writeHead(204); res.end(); return;
+  }
+  if (/\/health(\?|$)/.test(req.url || '')){
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, rooms: rooms.size, sockets: sockCount,
+                             maxSockets: MAX_SOCKETS, maxRooms: MAX_ROOMS }));
     return;
   }
   try {
@@ -140,7 +151,8 @@ function Sock(socket){
 }
 
 server.on('upgrade', (req, socket) => {
-  if (!/^\/ws\b/.test(req.url || '')){ socket.destroy(); return; }
+  // nginx 뒤에 서브경로로 붙을 수 있다 (/neotone/ws 처럼). 끝이 /ws 면 받는다.
+  if (!/\/ws(\?|$)/.test(req.url || '')){ socket.destroy(); return; }
   const key = req.headers['sec-websocket-key'];
   if (!key){ socket.destroy(); return; }
   const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
@@ -149,6 +161,12 @@ server.on('upgrade', (req, socket) => {
     'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
     'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n');
   socket.setNoDelay(true);
+  if (sockCount >= MAX_SOCKETS){
+    try { socket.end(); } catch(e){}
+    log('접속 한도(' + MAX_SOCKETS + ')를 넘어 거절');
+    return;
+  }
+  sockCount++;
   handle(Sock(socket));
 });
 
@@ -177,6 +195,7 @@ function handle(sock){
   };
 
   sock.onclose = () => {
+    sockCount = Math.max(0, sockCount - 1);
     const r = sock.room && rooms.get(sock.room);
     if (!r) return;
     if (sock.isHost){
@@ -197,6 +216,11 @@ function join(sock, m){
 
   if (m.host){
     if (rooms.has(code)){ sock.sendText(JSON.stringify({ sys: 'taken' })); return; }
+    if (rooms.size >= MAX_ROOMS){
+      sock.sendText(JSON.stringify({ sys: 'taken' }));
+      log('방 한도(' + MAX_ROOMS + ') 초과 — ' + code + ' 거절');
+      return;
+    }
     sock.id = 0; sock.room = code; sock.isHost = true;
     rooms.set(code, { host: sock, clients: new Map(), nextId: 1 });
     sock.sendText(JSON.stringify({ sys: 'id', id: 0, hostId: 0 }));
@@ -251,20 +275,28 @@ function log(msg){
   console.log('[' + t + '] ' + msg);
 }
 
-server.listen(PORT, () => {
+server.listen(PORT, BIND, () => {
   console.log('');
   console.log('  NEOTONE 릴레이 서버가 떴습니다.');
   console.log('');
-  console.log('    이 PC에서       http://localhost:' + PORT + '/');
-  console.log('    같은 와이파이   http://<이 PC의 IP>:' + PORT + '/');
+  if (BIND === '127.0.0.1' || BIND === 'localhost'){
+    console.log('    ' + BIND + ':' + PORT + ' 에만 바인딩했습니다 (바깥에서 직접 접속 불가).');
+    console.log('    nginx 같은 리버스 프록시를 앞에 두는 구성입니다.');
+  } else {
+    console.log('    이 PC에서       http://localhost:' + PORT + '/');
+    console.log('    같은 와이파이   http://<이 PC의 IP>:' + PORT + '/');
+  }
   console.log('');
-  console.log('  다른 네트워크에 있는 친구도 부르려면, 다른 터미널에서:');
-  console.log('');
-  console.log('    cloudflared tunnel --url http://localhost:' + PORT);
-  console.log('');
-  console.log('  → https://....trycloudflare.com 주소가 나옵니다. 그 주소를 공유하세요.');
-  console.log('    (그 주소로 들어온 사람은 자동으로 이 서버를 통해 연결됩니다)');
-  console.log('');
-  console.log('  끄려면 Ctrl+C. 서버를 끄면 진행 중이던 방도 함께 닫힙니다.');
+  if (BIND !== '127.0.0.1' && BIND !== 'localhost'){
+    console.log('  다른 네트워크에 있는 친구도 부르려면, 다른 터미널에서:');
+    console.log('');
+    console.log('    cloudflared tunnel --url http://localhost:' + PORT);
+    console.log('');
+    console.log('  → https://....trycloudflare.com 주소가 나옵니다. 그 주소를 공유하세요.');
+    console.log('    (그 주소로 들어온 사람은 자동으로 이 서버를 통해 연결됩니다)');
+    console.log('');
+  }
+  console.log('  동시 접속 한도 ' + MAX_SOCKETS + '명 · 동시 방 한도 ' + MAX_ROOMS + '개');
+  console.log('  끄려면 Ctrl+C (서비스로 돌리는 경우는 systemctl stop neotone).');
   console.log('');
 });
