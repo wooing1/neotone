@@ -881,6 +881,17 @@ function spawnPShot(x,y,vx,vy,dmg,homing){
 }
 // 유도 미사일이 노릴 대상 (가장 가까운 적 → 없으면 보스)
 function homingTarget(x, y){
+  // 게스트는 로컬 적 배열이 비어 있다 — 호스트가 보내준 월드를 봐야 유도가 걸린다
+  if (Net.isOnline() && !Net.isHost()){
+    let best = null, bd = 1e9;
+    if (G && G.mode === 'BOSS' && NetWorld.boss.alive) return { x: NetWorld.boss.x, y: NetWorld.boss.y };
+    for (let i=0;i<NetWorld.enemies.length;i++){
+      const e = NetWorld.enemies[i];
+      const d = (e.x-x)*(e.x-x) + (e.y-y)*(e.y-y);
+      if (d < bd){ bd = d; best = e; }
+    }
+    return best;
+  }
   let best = null, bd = 1e9;
   for (let i=0;i<MAX_ENEMY;i++){
     const e = enemies[i];
@@ -2416,8 +2427,14 @@ function updatePShots(){
   const bossR = 42;   // 코어 + 안쪽 링에 맞춘 반경
   // 데미지 판정은 호스트 한 곳에서만 한다. 클라이언트는 자탄을 "보여주기 위해"
   // 똑같이 날려 보내기만 한다 (직선이라 호스트 쪽과 눈에 띄게 어긋나지 않는다).
+  // 데미지 판정은 호스트만 한다. 다만 게스트에서도 "맞으면 사라지는" 것까지 막아 버리면
+  // 자탄이 보스를 관통해 계속 날아가고 유도탄은 150프레임 내내 궤도를 돈다 —
+  // 최종 보스에서 화면이 미사일 잔상으로 뒤덮이던 원인이다. 소멸은 양쪽에서 똑같이 한다.
   const visualOnly = Net.isOnline() && !Net.isHost();
-  const bossHittable = !visualOnly && (G.mode === 'BOSS' && b.alive && G.transition <= 0);
+  const bossAlive  = visualOnly ? NetWorld.boss.alive : b.alive;
+  const bossHittable = (G.mode === 'BOSS' && bossAlive && G.transition <= 0);
+  const bx = visualOnly ? NetWorld.boss.x : b.x;
+  const by = visualOnly ? NetWorld.boss.y : b.y;
   for (let i=0;i<MAX_PSHOT;i++){
     const s = pshots[i];
     if (!s.on) continue;
@@ -2445,10 +2462,10 @@ function updatePShots(){
     if (s.y < PF.y-30 || s.x < PF.x-40 || s.x > PF.x+PF.w+40 || s.y > PF.y+PF.h+40){ s.on=false; continue; }
 
     if (bossHittable){
-      const dx = s.x-b.x, dy = s.y-b.y;
+      const dx = s.x-bx, dy = s.y-by;
       if (dx*dx+dy*dy < bossR*bossR){
         s.on = false;
-        damageBoss(s.dmg);
+        if (!visualOnly) damageBoss(s.dmg);
         for (let q=0;q<2;q++){
           const a = -Math.PI/2 + (Math.random()-0.5)*1.8, v = 1.2+Math.random()*2.2;
           spawnPart(s.x, s.y, Math.cos(a)*v, Math.sin(a)*v, 10+Math.random()*7, '#ffffff', 1.6, 'spark');
@@ -2457,7 +2474,24 @@ function updatePShots(){
       }
     }
     // 잡몹 / 중간보스 피격
-    if (visualOnly) continue;
+    if (visualOnly){
+      // 게스트: 데미지는 없지만 같은 자리에서 사라지고 같은 불꽃을 낸다
+      const es = NetWorld.enemies;
+      for (let k=0;k<es.length;k++){
+        const e = es[k];
+        const r = ETYPE_R[e.type] || 15;
+        const dx = s.x-e.x, dy = s.y-e.y;
+        if (dx*dx+dy*dy < r*r){
+          s.on = false;
+          for (let q=0;q<2;q++){
+            const a = -Math.PI/2 + (Math.random()-0.5)*1.6, v = 1.2+Math.random()*2;
+            spawnPart(s.x, s.y, Math.cos(a)*v, Math.sin(a)*v, 10+Math.random()*7, '#ffffff', 1.6, 'spark');
+          }
+          break;
+        }
+      }
+      continue;
+    }
     for (let k=0;k<MAX_ENEMY;k++){
       const e = enemies[k];
       if (!e.on) continue;
@@ -2576,6 +2610,9 @@ function updateParts(){
 
 function endRun(cleared){
   G.finished = true;
+  // 종료는 호스트 권위다. 예전에는 이걸 보내지 않아서 호스트가 CLEAR 로 가도
+  // 게스트는 PLAY 에 영원히 멈춰 있었다.
+  if (Net.isOnline() && Net.isHost()) netSendEvent('end', { c: cleared ? 1 : 0 });
   if (cleared){
     addScore(G.lives * 100000);
     addScore(G.bombs * 30000);
@@ -2599,6 +2636,10 @@ const IKIND_ID = { score:0, power:1, homing:2, bomb:3, shield:4 };
 const ID_IKIND = ['score','power','homing','bomb','shield'];
 const MODE_ID = { STAGE:0, BOSS:1, INTERLUDE:2 };
 const ID_MODE = ['STAGE','BOSS','INTERLUDE'];
+
+// 클라이언트는 적의 반경을 스냅샷으로 받지 않는다 — 타입에서 되살린다
+// (spawnEnemy 의 e.r 과 같은 값이어야 자탄이 호스트와 같은 지점에서 사라진다)
+const ETYPE_R = { straight: 15*PLANE_SCALE, sine: 17*PLANE_SCALE, turret: 21*PLANE_SCALE, midboss: 30 };
 
 const NET_MAX_B = 400, NET_MAX_E = 40, NET_MAX_I = 120;
 // HUD 구간 이름도 1바이트로 실어 보낸다 (클라이언트 HUD가 옛 구간에서 멈추지 않게)
@@ -2720,6 +2761,7 @@ function encodeSnapshot(){
 const NetWorld = {
   segName: '',
   bullets: [], enemies: [], items: [],
+  _prevE: [], _bossWas: true,          // 격추 감지용 (직전 스냅샷의 적 / 보스 생존)
   boss: { x: LW/2, y: PF.y+120, alive: true },
   phaseHP: 1, phaseHPMax: 1, mode: 'STAGE', phase: 0, frame: 0,
 };
@@ -2760,6 +2802,14 @@ function decodeSnapshot(buf){
     NetWorld.bullets.push({ x, y, kind:k, rot });
   }
   const ne = v.getUint8(o); o += 1;
+  // 폭발 이펙트는 스냅샷에 없다 (호스트 로컬). 그래서 게스트 화면은 늘 밋밋했다.
+  // 직전 스냅샷에 있던 적이 사라졌으면 격추로 보고 같은 자리에서 터뜨린다.
+  const prevE = NetWorld._prevE;
+  prevE.length = 0;
+  for (let i=0;i<NetWorld.enemies.length;i++){
+    const e = NetWorld.enemies[i];
+    prevE.push(e.x, e.y, e.type);
+  }
   NetWorld.enemies.length = 0;
   for (let i=0;i<ne;i++){
     const x = v.getInt16(o); o += 2;
@@ -2768,6 +2818,23 @@ function decodeSnapshot(buf){
     const hp = v.getUint8(o) / 255; o += 1;
     NetWorld.enemies.push({ x, y, type:t, hpPct:hp });
   }
+  for (let i=0;i<prevE.length;i+=3){
+    const px = prevE[i], py = prevE[i+1], pt = prevE[i+2];
+    // 화면 밖으로 빠져나간 적은 격추가 아니다
+    if (py < PF.y - 10 || py > PF.y + PF.h - 50) continue;
+    if (px < PF.x - 10 || px > PF.x + PF.w + 10) continue;
+    let alive = false;
+    for (let k=0;k<NetWorld.enemies.length;k++){
+      const e = NetWorld.enemies[k];
+      if (e.type !== pt) continue;
+      const dx = e.x - px, dy = e.y - py;
+      if (dx*dx + dy*dy < 2500){ alive = true; break; }   // 50px 안이면 같은 적
+    }
+    if (!alive) explode(px, py, pt === 'midboss' ? 3.4 : 1.5, '#ffd08a', '#6b4a3a');
+  }
+  if (NetWorld._bossWas && !NetWorld.boss.alive)
+    explode(NetWorld.boss.x, NetWorld.boss.y, 4.2, '#ffe6a0', '#7a5560');
+  NetWorld._bossWas = NetWorld.boss.alive;
   const ni = v.getUint8(o); o += 1;
   NetWorld.items.length = 0;
   for (let i=0;i<ni;i++){
@@ -2847,6 +2914,13 @@ function netApplyEvent(d){
     case 'over':
       if (d.s !== undefined && Net.players[d.s]) Net.players[d.s].spectating = true;
       break;
+    case 'end':                        // 호스트가 런을 끝냈다 → 게스트도 같이 끝낸다
+      if (!Net.isHost() && G && !G.finished){
+        G.finished = true;
+        G.spectating = false;
+        state = d.c ? S.CLEAR : S.GAMEOVER;
+      }
+      break;
   }
 }
 
@@ -2864,7 +2938,18 @@ function updatePlay(){
     G.bannerPrev = G.banner;
     if (G.banner > 0) G.banner--;
     const segKey = NetWorld.mode + NetWorld.phase;
-    if (G._segKey !== undefined && G._segKey !== segKey) reviveIfDown();
+    if (G._segKey !== undefined && G._segKey !== segKey){
+      reviveIfDown();
+      // 배너와 틴트는 startPhase()/updateStage() 안에서 세팅되는데 그건 호스트만 돈다.
+      // 그래서 게스트는 스펠 이름이 안 뜨고 배경색도 안 바뀌었다 — 복제된 구간 정보로 되살린다.
+      if (NetWorld.mode === 'BOSS' && SPELLS[NetWorld.phase]){
+        G.banner = 150; G.bannerText = null;      // null 이면 drawBanner 가 SPELLS[phase] 를 쓴다
+        G.tint = SPELLS[NetWorld.phase].tint;
+        Sound.spell();
+      } else if (NetWorld.segName){
+        G.banner = 100; G.bannerText = NetWorld.segName;
+      }
+    }
     G._segKey = segKey;
     G.mode = NetWorld.mode; G.phase = NetWorld.phase;
     G.phaseHP = NetWorld.phaseHP; G.phaseHPMax = NetWorld.phaseHPMax;
@@ -2935,33 +3020,41 @@ function netTick(){
   if (Net.isHost()){
     if (Net.sendTick % 2 === 0 && Net.tp) Net.sendAll(encodeSnapshot());
   } else {
-    if (Net.tp) Net.sendUp(encodeClientState());
+    // 호스트와 같은 30Hz. 예전에는 게스트만 스텝마다 보내서 2배(캐치업 시 최대 5배)였다.
+    if (Net.sendTick % 2 === 0 && Net.tp) Net.sendUp(encodeClientState());
   }
   fireMateShots();
 }
 
 /* ── 클라이언트: 스냅샷 탄으로 자기 피격/그레이즈를 직접 판정 (입력 지연 없이) ── */
+// 스냅샷은 탄을 매번 새로 만들어 보내므로 "이 탄을 이미 스쳤다" 는 표시를 탄에 붙일 수 없다.
+// (예전에는 b._g 를 썼는데 스냅샷마다 초기화돼 초당 수백 번 Sound.graze() 가 터졌다 —
+//  호스트 대비 17배. 오디오 노드가 쌓이면서 그게 게스트 화면 렉의 주범이었다.)
+// 그래서 개수 차분으로 센다: 사거리 안의 탄 수가 늘어난 만큼만 새로 스친 것으로 본다.
+let clientGrazeNear = 0;
 function clientCollide(){
-  if (G.spectating || G.finished) return;
+  if (G.spectating || G.finished){ clientGrazeNear = 0; return; }
   const bs = NetWorld.bullets;
+  const gr = player.grazeR + 6, gr2 = gr*gr;
+  const hr = player.hitR + 4.3, hr2 = hr*hr;
+  let near = 0;
   for (let i=0;i<bs.length;i++){
     const b = bs[i];
     const dx = b.x - player.x, dy = b.y - player.y;
     const d2 = dx*dx + dy*dy;
-    const gr = player.grazeR + 6;
-    if (d2 > gr*gr) continue;
-    if (!b._g){
-      b._g = true;
-      G.graze++; G.grazeCombo++;
-      addScore(100 * D.grazeMul);
-      Sound.graze(G.grazeCombo);
-    }
-    const hr = player.hitR + 4.3;
-    if (d2 < hr*hr && player.invuln <= 0 && player.pendingDeath < 0){
+    if (d2 > gr2) continue;
+    near++;
+    if (d2 < hr2 && player.invuln <= 0 && player.pendingDeath < 0){
       player.pendingDeath = 9;
       shake = Math.max(shake, 8);
     }
   }
+  if (near > clientGrazeNear){
+    const add = near - clientGrazeNear;
+    for (let k=0;k<add;k++){ G.graze++; G.grazeCombo++; addScore(100 * D.grazeMul); }
+    Sound.graze(G.grazeCombo);        // 소리는 묶어서 한 번만
+  }
+  clientGrazeNear = near;
 }
 const clientPicked = new Map();   // 아이템 id → 만료 프레임 (중복 획득 방지)
 function clientPickup(){
@@ -3366,6 +3459,12 @@ function drawRemotes(){
 
 // 클라이언트: 스냅샷으로 받은 월드를 그린다
 function drawNetWorld(){
+  drawNetItems();
+  drawNetEnemies();
+  drawNetBullets();
+}
+
+function drawNetItems(){
   for (let i=0;i<NetWorld.items.length;i++){
     const it = NetWorld.items[i];
     if (it._got) continue;
@@ -3373,6 +3472,9 @@ function drawNetWorld(){
               : (it.kind === 'score') ? SPR.item : SPR[it.kind];
     drawSprite(spr || SPR.item, it.x, it.y, 0, 1, 1);
   }
+}
+
+function drawNetEnemies(){
   for (let i=0;i<NetWorld.enemies.length;i++){
     const e = NetWorld.enemies[i];
     if (e.type === 'midboss'){
@@ -3390,6 +3492,9 @@ function drawNetWorld(){
       ctx.restore();
     }
   }
+}
+
+function drawNetBullets(){
   ctx.save();
   ctx.beginPath(); ctx.rect(PF.x-30, PF.y-30, PF.w+60, PF.h+60); ctx.clip();
   const sx = shakeX * drawScale, sy = shakeY * drawScale;
@@ -3737,7 +3842,10 @@ function applyBloom(){
   ctx = glowActx; drawScale = gs;
   ctx.setTransform(gs, 0, 0, gs, shakeX*gs, shakeY*gs);
   if (G && state !== S.TITLE && state !== S.MODE && state !== S.LOBBY){
-    if (Net.isOnline() && !Net.isHost()){ drawNetWorld(); drawPShots(); }
+    // 호스트는 글로우 버퍼에 자탄+적탄만 넣는다. 게스트도 똑같이 맞춘다.
+    // 예전에는 게스트만 drawNetWorld() 전체를 넣어서 적·아이템에 글로우가 한 겹 더 얹혔고
+    // (게스트 화면만 색이 밝게 보이는 원인) 그 전부를 프레임당 2번 그렸다.
+    if (Net.isOnline() && !Net.isHost()){ drawNetBullets(); drawPShots(); }
     else { drawPShots(); drawBullets(); }
     drawParts();
     drawRings();

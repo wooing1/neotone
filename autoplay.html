@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEOTONE 자동 플레이 / 진단</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#0a0d10;color:#dfe6ef;
+    font-family:'Menlo','Consolas',monospace;overflow:hidden}
+  #bar{height:44px;display:flex;align-items:center;gap:10px;padding:0 12px;
+    background:#11161c;border-bottom:1px solid #1e262f;white-space:nowrap;overflow-x:auto}
+  #bar h1{font-size:13px;font-weight:700;color:#ffd23d;letter-spacing:.5px;margin-right:6px}
+  button,select,input[type=number]{font-family:inherit;font-size:11px;color:#dfe6ef;
+    background:#1a222b;border:1px solid #2b3642;border-radius:5px;padding:5px 9px;cursor:pointer}
+  button:hover{border-color:#4a5a6b}
+  button.on{background:#243447;border-color:#5cff9e;color:#5cff9e}
+  button.warn{border-color:#ff6a5a;color:#ff6a5a}
+  label{font-size:11px;color:#8b97a5;display:flex;align-items:center;gap:4px}
+  #main{display:flex;height:calc(100% - 44px)}
+  #frames{flex:1;display:flex;gap:2px;background:#000;overflow:hidden}
+  .cell{flex:1;position:relative;min-width:0}
+  .cell iframe{width:100%;height:100%;border:0;display:block}
+  .cell .tag{position:absolute;top:0;left:0;background:rgba(0,0,0,.72);
+    font-size:10px;padding:2px 7px;border-bottom-right-radius:5px;z-index:2;pointer-events:none}
+  .cell.host .tag{color:#5cff9e}
+  .cell.client .tag{color:#7fb2cf}
+  #side{width:330px;background:#0d1218;border-left:1px solid #1e262f;
+    overflow-y:auto;padding:10px;font-size:11px;line-height:1.55}
+  h2{font-size:10px;color:#6b7a8a;margin:12px 0 5px;letter-spacing:1px}
+  table{width:100%;border-collapse:collapse;font-size:10.5px}
+  th,td{padding:2.5px 4px;text-align:right;border-bottom:1px solid #171f28}
+  th{color:#6b7a8a;font-weight:400;text-align:right}
+  td.k,th.k{text-align:left;color:#93a1b0}
+  .good{color:#5cff9e}.bad{color:#ff6a5a}.warn2{color:#ffd23d}.dim{color:#5a6875}
+  #alerts div{padding:5px 7px;margin-bottom:4px;border-radius:5px;
+    background:#1e1418;border-left:3px solid #ff6a5a;color:#ffb3a8;font-size:10.5px}
+  #alerts div.ok{background:#121c16;border-left-color:#5cff9e;color:#9fe8bd}
+  #log{font-size:9.5px;color:#63707e;max-height:150px;overflow-y:auto;
+    background:#080b0e;border:1px solid #171f28;border-radius:5px;padding:5px;white-space:pre}
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <h1>NEOTONE AUTOPLAY</h1>
+  <label>인원 <select id="np"><option>2</option><option>3</option><option selected>4</option></select></label>
+  <label>난이도 <select id="diff"><option>Easy</option><option selected>Normal</option><option>Hard</option><option>Lunatic</option></select></label>
+  <button id="go">시작</button>
+  <button id="stop" class="warn">정지</button>
+  <span class="dim">|</span>
+  <button data-ph="0">보스1</button>
+  <button data-ph="1">보스2</button>
+  <button data-ph="2">보스3</button>
+  <button data-ph="3">최종</button>
+  <span class="dim">|</span>
+  <label>탄 추가 <input type="number" id="stressN" value="200" min="0" max="900" style="width:58px"></label>
+  <button id="stress">주입</button>
+  <span class="dim">|</span>
+  <button id="endless" class="on">무한 모드</button>
+  <button id="csv">CSV</button>
+  <span id="clock" class="dim" style="margin-left:auto"></span>
+</div>
+
+<div id="main">
+  <div id="frames"></div>
+  <div id="side">
+    <h2>상태</h2>
+    <table id="tState"></table>
+    <h2>프레임 (loop 자체 실행시간, ms)</h2>
+    <table id="tPerf"></table>
+    <h2>월드 부하</h2>
+    <table id="tLoad"></table>
+    <h2>호스트 대비 게스트 편차</h2>
+    <div id="alerts"></div>
+    <h2>로그</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════
+   NEOTONE 자동 플레이 / 진단 하네스
+
+   게임을 iframe 으로 여러 개 띄워 호스트 1 + 게스트 N 으로 방을 만들고,
+   게임에 내장된 회피 AI(__game.autoDodge)로 전원을 자동 조종한다.
+
+   왜 iframe 인가 —
+     크롬은 "숨겨진 탭" 의 requestAnimationFrame 을 완전히 정지시킨다.
+     탭을 두 개 열어 놓고 게스트 화면을 재려 하면 뒤에 있는 쪽은 0프레임이 된다
+     (실측: 8초에 호스트 503프레임 / 게스트 0프레임).
+     같은 창 안의 iframe 은 전부 visible 이라 이 문제가 없고,
+     동일 출처라 스크립트로 양쪽 내부를 다 들여다볼 수 있다.
+
+   반드시 게임과 같은 출처(같은 도메인·포트)에 두어야 한다.
+     예) /var/www/games/autoplay.html  →  https://…/autoplay.html
+   ═══════════════════════════════════════════════════════════════ */
+
+const GAME = '/plane/';                 // 게임 경로 (같은 출처)
+const $ = s => document.querySelector(s);
+const frames = $('#frames');
+
+let inst = [];          // { role, win, frame, perf, name }
+let room = '';
+let driver = null, sampler = null;
+let endless = true;
+let t0 = 0;
+const hist = [];        // CSV 용 기록
+const logLines = [];
+
+function log(s){
+  const t = t0 ? ((performance.now() - t0) / 1000).toFixed(1) : '0.0';
+  logLines.unshift('[' + t + 's] ' + s);
+  if (logLines.length > 200) logLines.pop();
+  $('#log').textContent = logLines.slice(0, 40).join('\n');
+}
+
+/* ── loop() 자체 실행시간 계측 ──
+   페이지의 requestAnimationFrame 을 감싸면 게임 루프 콜백의 소요 시간만 정확히 잡힌다.
+   (캔버스 명령은 큐에 쌓였다 나중에 래스터되므로 이 값은 "자바스크립트 비용" 이다.
+    실제 화면 끊김은 fps 와 over16 을 함께 봐야 한다.) */
+function instrument(w, name){
+  if (w.__perf) return w.__perf;
+  const p = { name, n:0, d:[], t0:w.performance.now() };
+  const orig = w.requestAnimationFrame.bind(w);
+  w.requestAnimationFrame = function(cb){
+    return orig(function(t){
+      const s = w.performance.now();
+      try { cb(t); }
+      finally {
+        const e = w.performance.now();
+        p.d.push(e - s);
+        if (p.d.length > 4000) p.d.shift();
+        p.n++;
+      }
+    });
+  };
+  p.reset = () => { p.n = 0; p.d.length = 0; p.t0 = w.performance.now(); };
+  p.report = () => {
+    const a = p.d.slice().sort((x, y) => x - y);
+    const q = f => a.length ? +a[Math.floor(a.length * f)].toFixed(2) : 0;
+    const el = (w.performance.now() - p.t0) / 1000;
+    return {
+      fps: +(p.n / Math.max(0.001, el)).toFixed(1),
+      mean: +(a.reduce((x, c) => x + c, 0) / (a.length || 1)).toFixed(2),
+      p50: q(.5), p95: q(.95), p99: q(.99),
+      max: a.length ? +a[a.length - 1].toFixed(2) : 0,
+      over16: +(100 * a.filter(v => v > 16.7).length / (a.length || 1)).toFixed(1),
+    };
+  };
+  w.__perf = p;
+  return p;
+}
+
+const wait = ms => new Promise(r => setTimeout(r, ms));
+function frameReady(f){
+  return new Promise(r => { f.onload = r; setTimeout(r, 12000); });
+}
+async function until(fn, ms){
+  const end = performance.now() + ms;
+  while (performance.now() < end){ try { if (fn()) return true; } catch(e){} await wait(150); }
+  return false;
+}
+
+function addCell(role, q){
+  const d = document.createElement('div');
+  d.className = 'cell ' + role;
+  const tag = document.createElement('div');
+  tag.className = 'tag';
+  tag.textContent = role === 'host' ? 'HOST' : 'GUEST';
+  const f = document.createElement('iframe');
+  f.src = GAME + q;
+  d.appendChild(f); d.appendChild(tag);
+  frames.appendChild(d);
+  return f;
+}
+
+async function start(){
+  await stop();
+  frames.innerHTML = '';
+  inst = []; hist.length = 0; logLines.length = 0;
+  t0 = performance.now();
+  const n = +$('#np').value;
+  room = 'AP' + Math.floor(Math.random() * 900 + 100);
+  log('방 ' + room + ' / ' + n + '인 준비');
+
+  const hf = addCell('host', '?host=' + room);
+  await frameReady(hf);
+  await wait(2000);
+  const hw = hf.contentWindow;
+  if (!hw.__game){ log('✗ 호스트 로드 실패 — 경로/출처를 확인하세요'); return; }
+  inst.push({ role:'host', win:hw, frame:hf, name:'HOST', perf:instrument(hw, 'HOST') });
+  await until(() => hw.__game.net.connected, 12000);
+  log('호스트 연결 (' + hw.__game.net.transport + ')');
+
+  for (let i = 1; i < n; i++){
+    const cf = addCell('client', '?join=' + room);
+    await frameReady(cf);
+    await wait(1800);
+    const cw = cf.contentWindow;
+    if (!cw.__game){ log('✗ 게스트' + i + ' 로드 실패'); continue; }
+    inst.push({ role:'client', win:cw, frame:cf, name:'G' + i, perf:instrument(cw, 'G' + i) });
+    await until(() => cw.__game.net.connected, 12000);
+    log('게스트' + i + ' 슬롯 ' + cw.__game.net.mySlot);
+  }
+
+  // 난이도 (호스트만 바꾸면 로비에서 전파된다)
+  const d = $('#diff').value;
+  const di = ['Easy','Normal','Hard','Lunatic'].indexOf(d);
+  if (di >= 0) hw.__game.uiTap('diff' + di);
+  await wait(400);
+
+  for (const it of inst) it.win.__game.uiTap('ready');
+  await until(() => hw.__game.net.allReady, 8000);
+  await wait(500);
+  hw.__game.uiTap('start');
+  await until(() => hw.__game.screen === 'PLAY', 8000);
+  log('게임 시작 · 난이도 ' + d);
+
+  startDriver();
+  startSampler();
+}
+
+async function stop(){
+  if (driver){ clearInterval(driver); driver = null; }
+  if (sampler){ clearInterval(sampler); sampler = null; }
+  await wait(30);
+}
+
+/* ── 자동 조종 ──
+   게임에 내장된 회피 AI 를 60Hz 로 호출한다.
+   무한 모드에서는 페이즈 HP·잔기를 되돌려 놓아 몇 시간이고 같은 구간을 돌린다
+   (봄은 막는다 — 봄이 탄을 전부 지워 버리면 부하 측정이 무의미해진다). */
+function startDriver(){
+  driver = setInterval(() => {
+    for (const it of inst){
+      try {
+        const g = it.win.__game;
+        if (g.screen !== 'PLAY') continue;
+        if (endless){
+          const G = g.G;
+          if (it.role === 'host' && G){ G.phaseHP = G.phaseHPMax; G.lives = 5; }
+          if (G) G.bombs = 0;
+          g.player.invuln = 9999;
+        }
+        const t = g.aimTarget();
+        g.autoDodge(t ? t.x : undefined);
+      } catch(e){}
+    }
+  }, 16);
+}
+
+function num(v, digits){ return (v === undefined || v === null) ? '–' : (+v).toFixed(digits === undefined ? 0 : digits); }
+function cls(v, warnAt, badAt){ return v >= badAt ? 'bad' : v >= warnAt ? 'warn2' : 'good'; }
+
+let prevGraze = new Map(), prevT = 0;
+
+function startSampler(){
+  prevGraze = new Map(); prevT = performance.now();
+  sampler = setInterval(() => {
+    const now = performance.now();
+    const dt = (now - prevT) / 1000; prevT = now;
+    const rows = [];
+    for (const it of inst){
+      let g, r = {};
+      try { g = it.win.__game; } catch(e){ continue; }
+      const perf = it.perf.report();
+      it.perf.reset();
+      const gz = (g.G && g.G.graze) || 0;
+      const pg = prevGraze.get(it.name);
+      const grazeRate = (pg === undefined || dt <= 0) ? 0 : Math.max(0, (gz - pg) / dt);
+      prevGraze.set(it.name, gz);
+      const world = g.net.world || {};
+      r = {
+        name: it.name, role: it.role,
+        screen: g.screen, state: g.state,
+        bullets: it.role === 'host' ? g.bulletCount : world.bullets,
+        pshots: g.pshotCount, parts: g.partCount,
+        graze: +grazeRate.toFixed(1),
+        score: (g.G && g.G.score) || 0,
+        lives: (g.G && g.G.lives),
+        bloom: g.bloom, pq: g.partQualityNow,
+        perf,
+      };
+      rows.push(r);
+    }
+    render(rows);
+    hist.push({ t: +((now - t0) / 1000).toFixed(1), rows });
+    if (hist.length > 5000) hist.shift();
+    $('#clock').textContent = ((now - t0) / 1000).toFixed(0) + 's · ' + hist.length + ' samples';
+  }, 500);
+}
+
+function render(rows){
+  if (!rows.length) return;
+  const host = rows.find(r => r.role === 'host');
+  const gs = rows.filter(r => r.role === 'client');
+
+  const th = k => '<th class="k">' + k + '</th>' + rows.map(r =>
+    '<th>' + (r.role === 'host' ? '<span class="good">' : '<span style="color:#7fb2cf">') + r.name + '</span></th>').join('');
+
+  $('#tState').innerHTML =
+    '<tr>' + th('') + '</tr>' +
+    row('화면', rows.map(r => r.screen)) +
+    row('잔기', rows.map(r => num(r.lives))) +
+    row('점수', rows.map(r => num(r.score)));
+
+  $('#tPerf').innerHTML =
+    '<tr>' + th('') + '</tr>' +
+    row('fps', rows.map(r => '<span class="' + (r.perf.fps < 50 ? 'bad' : r.perf.fps < 58 ? 'warn2' : 'good') + '">' + num(r.perf.fps, 1) + '</span>')) +
+    row('p50', rows.map(r => num(r.perf.p50, 2))) +
+    row('p95', rows.map(r => num(r.perf.p95, 2))) +
+    row('p99', rows.map(r => '<span class="' + cls(r.perf.p99, 8, 16) + '">' + num(r.perf.p99, 2) + '</span>')) +
+    row('최대', rows.map(r => num(r.perf.max, 2))) +
+    row('&gt;16.7ms %', rows.map(r => '<span class="' + cls(r.perf.over16, 1, 5) + '">' + num(r.perf.over16, 1) + '</span>'));
+
+  $('#tLoad').innerHTML =
+    '<tr>' + th('') + '</tr>' +
+    row('적탄', rows.map(r => num(r.bullets))) +
+    row('자탄', rows.map(r => num(r.pshots))) +
+    row('파티클', rows.map(r => num(r.parts))) +
+    row('그레이즈/초', rows.map(r => num(r.graze, 1))) +
+    row('블룸', rows.map(r => num(r.bloom, 2))) +
+    row('파티클품질', rows.map(r => num(r.pq, 1)));
+
+  // ── 편차 검사: 게스트가 호스트와 달라진 지점을 잡아낸다
+  const al = [];
+  if (host){
+    for (const g of gs){
+      if (g.screen !== host.screen)
+        al.push('✗ 화면 상태 불일치 — HOST=' + host.screen + ' / ' + g.name + '=' + g.screen +
+                (host.screen === 'CLEAR' || host.screen === 'GAMEOVER' ? '  (게임 종료가 게스트에 전달되지 않음)' : ''));
+      if (host.parts > 3 && g.parts === 0)
+        al.push('✗ ' + g.name + ' 파티클 0 (호스트 ' + host.parts + ') — 폭발·피격 이펙트가 복제되지 않음');
+      // 호스트가 0/s 인데 게스트만 튀는 경우가 가장 심한 형태다. 비율만 보면 0 으로 나눠서 놓친다.
+      if (g.graze > 8 && g.graze > host.graze * 3 + 6)
+        al.push('✗ ' + g.name + ' 그레이즈 ' + g.graze.toFixed(1) + '/s vs 호스트 ' + host.graze.toFixed(1) +
+                '/s — 사운드 폭주 (스냅샷마다 중복 판정)');
+      if (host.pshots > 10 && g.pshots > host.pshots * 1.4)
+        al.push('✗ ' + g.name + ' 자탄 ' + g.pshots + ' vs 호스트 ' + host.pshots + ' — 피격 소멸이 안 돼 잔상이 쌓임');
+      if (host.bullets > 5 && (g.bullets === 0 || g.bullets === undefined))
+        al.push('✗ ' + g.name + ' 적탄 0 (호스트 ' + host.bullets + ') — 스냅샷이 끊겼습니다');
+      if (g.perf.over16 > 2)
+        al.push('⚠ ' + g.name + ' 프레임의 ' + g.perf.over16 + '% 가 16.7ms 초과');
+    }
+  }
+  $('#alerts').innerHTML = al.length
+    ? al.map(s => '<div>' + s + '</div>').join('')
+    : '<div class="ok">✓ 편차 없음</div>';
+
+  function row(k, vals){
+    return '<tr><td class="k">' + k + '</td>' + vals.map(v => '<td>' + v + '</td>').join('') + '</tr>';
+  }
+}
+
+/* ── 컨트롤 ── */
+$('#go').onclick = () => start().catch(e => log('✗ ' + e.message));
+$('#stop').onclick = () => { stop(); log('정지'); };
+$('#endless').onclick = e => { endless = !endless; e.target.classList.toggle('on', endless);
+                               log('무한 모드 ' + (endless ? 'ON' : 'OFF')); };
+document.querySelectorAll('[data-ph]').forEach(b => b.onclick = () => {
+  const h = inst.find(i => i.role === 'host');
+  if (!h) return;
+  h.win.__game.jumpPhase(+b.dataset.ph);
+  log('페이즈 ' + (+b.dataset.ph + 1) + ' 로 이동');
+});
+$('#stress').onclick = () => {
+  const h = inst.find(i => i.role === 'host');
+  if (!h) return;
+  const n = +$('#stressN').value || 0;
+  h.win.__game.stress(n);
+  log('탄 ' + n + '발 주입 (호스트 ' + h.win.__game.bulletCount + '발)');
+};
+$('#csv').onclick = () => {
+  if (!hist.length) return log('기록 없음');
+  const names = hist[hist.length - 1].rows.map(r => r.name);
+  const cols = ['fps','p95','p99','over16','bullets','pshots','parts','graze'];
+  let out = 't';
+  for (const n of names) for (const c of cols) out += ',' + n + '_' + c;
+  out += '\n';
+  for (const h of hist){
+    out += h.t;
+    for (const n of names){
+      const r = h.rows.find(x => x.name === n) || {};
+      for (const c of cols){
+        const v = (c in (r.perf || {})) ? r.perf[c] : r[c];
+        out += ',' + (v === undefined ? '' : v);
+      }
+    }
+    out += '\n';
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([out], {type:'text/csv'}));
+  a.download = 'neotone-autoplay-' + Date.now() + '.csv';
+  a.click();
+  log('CSV ' + hist.length + '행 저장');
+};
+
+log('준비됨 — [시작] 을 누르세요');
+</script>
+</body>
+</html>

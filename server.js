@@ -53,6 +53,18 @@ const server = http.createServer((req, res) => {
   if (/favicon\.ico$/.test(req.url || '')){   // 콘솔에 404 가 남지 않게
     res.writeHead(204); res.end(); return;
   }
+  // 자동 플레이 / 진단 하네스 (같은 출처여야 iframe 내부를 들여다볼 수 있다)
+  if (/\/autoplay(\.html)?(\?|$)/.test(req.url || '')){
+    try {
+      const ap = fs.readFileSync(path.join(__dirname, 'autoplay.html'), 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(ap);
+    } catch (e){
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('autoplay.html 을 server.js 와 같은 폴더에 두세요.\n' + e.message);
+    }
+    return;
+  }
   if (/\/health(\?|$)/.test(req.url || '')){
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, rooms: rooms.size, sockets: sockCount,
