@@ -55,6 +55,13 @@ const SPD_MIN = SPD_BASE;                  // 이 아래로는 내려가지 않�
 // 최고 속도를 구경도 못 하게 된다. 밟는 느낌은 그대로 두고 위쪽만 늘린 셈이다.
 const ACCEL = 0.135, COAST = 0.060;        // COAST = 페달 뗐을 때 기본 속도로 복귀
 const KMH = 16;                            // 표시용 환산 (기본 112 / 최고 360 km/h)
+// 기록은 시간이 아니라 거리다.
+//   시간 기준이면 가속이 순수한 손해가 된다 — 밟으면 접근 속도가 올라가 더 빨리 죽는데
+//   초는 오히려 줄어드니, 최적 전략이 "절대 안 밟기" 가 되어 가속 페달이 죽은 버튼이 된다.
+//   거리로 재면 밟을수록 기록이 늘어서 위험과 보상이 맞물린다.
+// 단위는 속도계에서 그대로 끌어온다: spd 는 프레임당 이동량이고 60fps 이므로
+//   1초에 spd*60 유닛 = (spd*KMH)/3.6 미터  →  1 유닛 = KMH/3.6/60 미터.
+const M_PER_UNIT = KMH / 3.6 / 60;         // ≈ 0.0741 m
 
 const PLAYER = { w: 32, h: 56, y: LH - 150 };
 // 판정 = 그려진 차체 그대로.
@@ -401,18 +408,19 @@ function uiHit(pt){
 /* ── 랭킹 (이 브라우저에 저장) ── */
 const RANK_MAX = 10;
 function loadRanks(){
-  try { const r = JSON.parse(localStorage.getItem('overtake-ranks') || '[]');
+  // v2 = 거리 기준. 예전 초 기준 기록(overtake-ranks)과 섞으면 순위가 엉킨다.
+  try { const r = JSON.parse(localStorage.getItem('overtake-ranks-v2') || '[]');
         return Array.isArray(r) ? r : []; } catch(e){ return []; }
 }
 function saveRanks(r){
-  try { localStorage.setItem('overtake-ranks', JSON.stringify(r.slice(0, RANK_MAX))); } catch(e){}
+  try { localStorage.setItem('overtake-ranks-v2', JSON.stringify(r.slice(0, RANK_MAX))); } catch(e){}
 }
 let ranks = loadRanks();
 let myRankIdx = -1;                 // 방금 넣은 기록의 순위 (하이라이트용)
 function addRank(entry){
   ranks = loadRanks();
   ranks.push(entry);
-  ranks.sort((a, b) => b.sec - a.sec);
+  ranks.sort((a, b) => (b.dist || 0) - (a.dist || 0));
   ranks = ranks.slice(0, RANK_MAX);
   saveRanks(ranks);
   return ranks.indexOf(entry);      // 10위 밖이면 -1
@@ -491,10 +499,12 @@ for (let i=0;i<MAX_PROP;i++) props.push({on:false,x:0,y:0,kind:0});
 const player = { x: LW/2, y: PLAYER.y, spd: SPD_START, vx: 0, tilt: 0, hurt: 0 };
 
 let G = null;
-let bestTime = 0, bestOver = 0;
+let bestDist = 0, bestOver = 0;
 let lastRun = null;          // 마지막 주행 기록 (시작 화면에 표시)
 try {
-  bestTime = parseFloat(localStorage.getItem('overtake-best') || '0') || 0;
+  // 키를 새로 뗀다 — 예전 'overtake-best' 는 초 단위라 그대로 읽으면 말이 안 된다.
+  // 예전 값은 지우지 않으니 되돌리고 싶으면 그대로 살아 있다.
+  bestDist = parseFloat(localStorage.getItem('overtake-best-d') || '0') || 0;
   bestOver = parseInt(localStorage.getItem('overtake-best-ot') || '0', 10) || 0;
 } catch(e){}
 
@@ -992,17 +1002,17 @@ function crash(c){
   for (let q=0;q<14;q++)
     spawnPart(player.x, player.y, (Math.random()-0.5)*3, (Math.random()-0.5)*3 + 1.5, 40, 'rgba(180,190,200,', 3);
 
-  const t = sec();
+  const t = sec(), d = G.dist;
   lastRun = { sec: t, overtakes: G.overtakes, nearMiss: G.nearMiss,
-              dist: G.dist, kmh: Math.round(player.spd * KMH), newBest: false };
-  G.newBest = t > bestTime;
+              dist: d, kmh: Math.round(player.spd * KMH), newBest: false };
+  G.newBest = d > bestDist;
   if (G.newBest){
-    bestTime = t; bestOver = G.overtakes;
-    try { localStorage.setItem('overtake-best', String(t)); localStorage.setItem('overtake-best-ot', String(G.overtakes)); } catch(e){}
+    bestDist = d; bestOver = G.overtakes;
+    try { localStorage.setItem('overtake-best-d', String(d)); localStorage.setItem('overtake-best-ot', String(G.overtakes)); } catch(e){}
     Sound.best();
   }
   lastRun.newBest = G.newBest;
-  myRankIdx = addRank({ sec: t, overtakes: G.overtakes, nearMiss: G.nearMiss,
+  myRankIdx = addRank({ dist: d, sec: t, overtakes: G.overtakes, nearMiss: G.nearMiss,
                         name: nick, ts: Date.now() });
   lastRun.rank = myRankIdx;
   overTick = 100;              // 약 1.7초 충돌 장면을 보여준 뒤 결과 화면으로
@@ -1208,6 +1218,11 @@ function fmtTime(s){
   const m = Math.floor(s / 60), r = s - m*60;
   return (m > 0 ? (m + ':' + (r < 10 ? '0' : '') + r.toFixed(1)) : r.toFixed(1) + '초');
 }
+// 주행 거리 (내부 유닛 → m / km)
+function fmtDist(u){
+  const m = u * M_PER_UNIT;
+  return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+}
 
 function drawHUD(){
   ctx.save();
@@ -1219,9 +1234,9 @@ function drawHUD(){
 
   ctx.textAlign = 'left';
   ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '9px Menlo, monospace';
-  ctx.fillText('TIME', 14, 15);
+  ctx.fillText('거리', 14, 15);
   ctx.fillStyle = '#ffffff'; ctx.font = 'bold 22px Menlo, monospace';
-  ctx.fillText(fmtTime(sec()), 14, 34);
+  ctx.fillText(fmtDist(G.dist), 14, 34);
 
   ctx.textAlign = 'right';
   ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '9px Menlo, monospace';
@@ -1245,17 +1260,15 @@ function drawHUD(){
   ctx.fillStyle = t > 0.8 ? '#ff7a5c' : t > 0.5 ? '#ffd257' : '#9fd6ff';
   ctx.fillRect(LW/2 - 44, 44, 88 * t, 4);
 
-  // 아슬아슬 카운터
-  if (G.nearMiss > 0){
-    ctx.textAlign = 'left';
-    ctx.fillStyle = 'rgba(255,240,170,0.75)'; ctx.font = '10px Menlo, monospace';
-    ctx.fillText('아슬아슬 ' + G.nearMiss, 14, 66);
-  }
+  // 시간 + 아슬아슬 (보조 지표)
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255,255,255,0.40)'; ctx.font = '10px Menlo, monospace';
+  ctx.fillText(fmtTime(sec()) + (G.nearMiss > 0 ? '   아슬아슬 ' + G.nearMiss : ''), 14, 66);
   // 최고 기록
-  if (bestTime > 0){
+  if (bestDist > 0){
     ctx.textAlign = 'right';
     ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.font = '10px Menlo, monospace';
-    ctx.fillText('BEST ' + fmtTime(bestTime), LW - 14, 66);
+    ctx.fillText('BEST ' + fmtDist(bestDist), LW - 14, 66);
   }
 
   // 구간 배너 — 차량 위에 겹쳐도 읽히도록 어두운 알약 배경을 깐다
@@ -1329,7 +1342,7 @@ function drawTitle(){
     ctx.fillText((lastRun.newBest ? '★ 최고 기록 ★' : '지난 기록') + rk, LW/2, y + 17);
 
     ctx.font = 'bold 30px Menlo, monospace'; ctx.fillStyle = '#ffffff';
-    ctx.fillText(fmtTime(lastRun.sec), LW/2, y + 46);
+    ctx.fillText(fmtDist(lastRun.dist || 0), LW/2, y + 46);
 
     ctx.font = '11px Menlo, monospace';
     ctx.textAlign = 'left';
@@ -1342,9 +1355,9 @@ function drawTitle(){
     y += bh + 18;
   } else y = 190;
 
-  if (bestTime > 0){
+  if (bestDist > 0){
     ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = '11px Menlo, monospace';
-    ctx.fillText('최고 기록  ' + fmtTime(bestTime) + '  ·  추월 ' + bestOver, LW/2, y);
+    ctx.fillText('최고 기록  ' + fmtDist(bestDist) + '  ·  추월 ' + bestOver, LW/2, y);
     y += 26;
   }
 
@@ -1354,7 +1367,7 @@ function drawTitle(){
   btn(LW/2 - 108, y, 216, 50, 'play', lastRun ? '다시 시도' : '시작하기', true);
   y += 60;
   btn(LW/2 - 108, y, 216, 40, 'rank', '랭킹', false,
-      ranks.length ? ('1위 ' + fmtTime(ranks[0].sec)) : '기록 없음');
+      ranks.length ? ('1위 ' + fmtDist(ranks[0].dist || 0)) : '기록 없음');
   y += 54;
 
   ctx.save();
@@ -1386,7 +1399,7 @@ function drawRank(){
   ctx.fillStyle = '#ffffff'; ctx.font = 'bold 24px Menlo, monospace';
   ctx.fillText('랭킹', LW/2, 60);
   ctx.fillStyle = 'rgba(255,255,255,0.40)'; ctx.font = '10px Menlo, monospace';
-  ctx.fillText(ranks.length ? ('버틴 시간 기준 TOP ' + RANK_MAX + '  ·  이 브라우저에 저장됩니다')
+  ctx.fillText(ranks.length ? ('주행 거리 기준 TOP ' + RANK_MAX + '  ·  이 브라우저에 저장됩니다')
                             : '아직 기록이 없습니다  ·  한 판 달려 보세요', LW/2, 84);
 
   const top = 108, rowH = 40;
@@ -1415,12 +1428,12 @@ function drawRank(){
     ctx.fillStyle = mine ? '#5cff9e' : 'rgba(255,255,255,0.78)';
     ctx.fillText((r.name || '나').slice(0, 8), 62, cy - 6);
     ctx.fillStyle = 'rgba(255,255,255,0.32)'; ctx.font = '9px Menlo, monospace';
-    ctx.fillText('추월 ' + (r.overtakes || 0) + '  ·  ' + fmtDate(r.ts || Date.now()), 62, cy + 8);
-    // 시간
+    ctx.fillText('추월 ' + (r.overtakes || 0) + '  ·  ' + fmtTime(r.sec || 0) + '  ·  ' + fmtDate(r.ts || Date.now()), 62, cy + 8);
+    // 거리
     ctx.textAlign = 'right';
     ctx.font = 'bold 17px Menlo, monospace';
     ctx.fillStyle = mine ? '#5cff9e' : '#ffffff';
-    ctx.fillText(fmtTime(r.sec), LW - 34, cy);
+    ctx.fillText(fmtDist(r.dist || 0), LW - 34, cy);
   }
   ctx.restore();
 
@@ -1594,7 +1607,7 @@ window.__race = {
   get sec(){ return G ? sec() : 0; },
   get fps(){ return fpsSamples.length ? fpsSamples.reduce((a,b)=>a+b,0)/fpsSamples.length : 0; },
   get diff(){ return G ? diff() : null; },
-  get best(){ return bestTime; },
+  get best(){ return bestDist; },
   get lastRun(){ return lastRun; },
   get gas(){ return { on: Input.gas || Input.up, box: GAS }; },
   // 겹친 차량 쌍 수 — 관통 검증용. 0 이어야 한다.
@@ -1655,7 +1668,7 @@ window.__race = {
   tap(id){ const b = uiBtns.find(b => b.id === id); if (!b) return false;
            Input.tapPos = { x: b.x + b.w/2, y: b.y + b.h/2 }; Input.tapAnywhere = true; return true; },
   go(s){ state = s; },
-  clearRanks(){ try { localStorage.removeItem('overtake-ranks'); } catch(e){} ranks = []; myRankIdx = -1; },
+  clearRanks(){ try { localStorage.removeItem('overtake-ranks-v2'); } catch(e){} ranks = []; myRankIdx = -1; },
   consts: { LW, LH, ROAD, LANES, LANE_W, SPD_BASE, SPD_MAX, PLAYER,
             T_LANECHANGE, T_WALL, T_ONCOMING },
 };
