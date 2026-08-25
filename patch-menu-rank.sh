@@ -6,38 +6,47 @@
 #   bash patch-menu-rank.sh /경로/index.html
 #
 # 기존 마크업·스타일을 건드리지 않고 필요한 것만 끼워 넣는다.
-# 원본은 index.html.bak.<날짜시각> 으로 백업하고, 여러 번 돌려도 안전하다.
+# 이미 일부만 적용된 상태에서 다시 돌려도 빠진 카드만 채운다.
+# 원본은 index.html.bak.<날짜시각> 으로 백업한다.
 set -euo pipefail
 F="${1:-/var/www/games/index.html}"
 [ -f "$F" ] || { echo "파일을 찾을 수 없습니다: $F"; exit 1; }
 BAK="$F.bak.$(date +%Y%m%d-%H%M%S)"
 cp -a "$F" "$BAK"
 
-python3 - "$F" <<'PY'
+python3 - "$F" <<'PYEOF'
 import io, re, sys
 path = sys.argv[1]
 src = io.open(path, encoding='utf-8').read()
 
-if 'arcade-rank' in src:
-    print('  이미 적용돼 있습니다.')
-    sys.exit(0)
+# ── 1. 카드 찾기.
+#     속성 순서를 가정하지 않는다. class="card" 인 <a> 를 전부 찾고 그 안에서 href 를 뽑는다.
+#     (이전 버전은 href 가 class 보다 앞에 오는 형태만 찾아서, 그 형태인 카드 하나에만 들어갔다)
+QQ = chr(34) + chr(39)                      # " 와 '
+HREF = re.compile('href=[' + QQ + ']/([a-z]+)/[' + QQ + ']')
+cards = []
+for m in re.finditer(r'<a\b[^>]*>[\s\S]*?</a>', src):
+    block = m.group(0)
+    if 'class="card"' not in block and "class='card'" not in block:
+        continue
+    hm = HREF.search(block)
+    if not hm:
+        continue
+    cards.append((m, hm.group(1)))
 
-# ── 1. 카드마다 랭킹이 들어갈 자리를 만든다
-#     href="/xxx/" 로 게임 키를 알아낸다. 카드 안쪽 </div> 앞(설명 p.d 다음)에 붙인다.
-cards = list(re.finditer(r'<a[^>]*href="/([a-z]+)/"[^>]*class="card"[\s\S]*?</a>', src))
-if not cards:
-    cards = list(re.finditer(r'<a[^>]*class="card"[^>]*href="/([a-z]+)/"[\s\S]*?</a>', src))
 if not cards:
     print('  ✗ 카드(<a class="card" href="/게임/">)를 찾지 못했습니다.')
     sys.exit(2)
 
-out, last = [], 0
-found = []
-for m in cards:
-    key = m.group(1)
+todo = [(m, k) for (m, k) in cards if 'data-g=' not in m.group(0)]
+if not todo and 'arcade-rank' in src:
+    print('  이미 적용돼 있습니다 ({0}개 카드 전부).'.format(len(cards)))
+    sys.exit(0)
+
+out, last, found = [], 0, []
+for m, key in todo:
     block = m.group(0)
-    # 설명 문단 </p> 뒤에 넣는다. 없으면 카드 끝 </a> 앞.
-    ins = '<div class="rk" data-g="%s"><div class="rkw">기록 불러오는 중…</div></div>' % key
+    ins = '<div class="rk" data-g="' + key + '"><div class="rkw">기록 불러오는 중…</div></div>'
     mp = list(re.finditer(r'</p>', block))
     if mp:
         at = mp[-1].end()
@@ -49,7 +58,6 @@ for m in cards:
 out.append(src[last:])
 src = ''.join(out)
 
-# ── 2. 스타일 (기존 색을 건드리지 않게 currentColor / 반투명만 쓴다)
 CSS = """
 <style>
 /* arcade-rank */
@@ -73,7 +81,6 @@ CSS = """
 </style>
 """
 
-# ── 3. 이름 입력줄 — 카드(<a>) 안에 넣으면 클릭이 링크로 먹히므로 반드시 바깥에 둔다
 NAMEBAR = """
 <div id="namebar">
   <span>랭킹에 쓸 이름</span>
@@ -172,19 +179,25 @@ JS = """
 </script>
 """
 
-# 스타일은 </head> 앞, 이름줄은 첫 카드 앞, 스크립트는 </body> 앞
-if '</head>' in src: src = src.replace('</head>', CSS + '</head>', 1)
-else:               src = CSS + src
+# 스타일/이름줄/스크립트는 이미 있으면 건너뛴다 (부분 적용 상태에서 다시 돌릴 수 있게)
+if '/* arcade-rank */' not in src:
+    src = src.replace('</head>', CSS + '</head>', 1) if '</head>' in src else CSS + src
 
-first = re.search(r'<a[^>]*class="card"', src)
-if first: src = src[:first.start()] + NAMEBAR + src[first.start():]
+if 'id="namebar"' not in src:
+    first = None
+    for m in re.finditer(r'<a\b[^>]*>', src):
+        seg = src[m.start():m.start()+400]
+        if 'class="card"' in seg or "class='card'" in seg:
+            first = m; break
+    if first: src = src[:first.start()] + NAMEBAR + src[first.start():]
 
-if '</body>' in src: src = src.replace('</body>', JS + '</body>', 1)
-else:               src = src + JS
+if 'arcade-rank —' not in src:
+    src = src.replace('</body>', JS + '</body>', 1) if '</body>' in src else src + JS
 
 io.open(path, 'w', encoding='utf-8').write(src)
-print('  ✓ 적용 완료 — 랭킹을 붙인 카드: ' + ', '.join(found))
-PY
+print('  ✓ 적용 완료 — 이번에 붙인 카드: {0} / 전체 카드 {1}개'.format(
+      ', '.join(found) if found else '(없음)', len(cards)))
+PYEOF
 
 RC=$?
 if [ "$RC" -eq 0 ]; then

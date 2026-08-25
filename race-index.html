@@ -416,6 +416,10 @@ function uiHit(pt){
 }
 
 
+// 게임 목록(메인 화면)으로 나가기. file:// 로 직접 열었으면 돌아갈 곳이 없다.
+const HAS_HOME = (function(){ try { return location.protocol !== 'file:'; } catch(e){ return false; } })();
+function goHome(){ try { location.href = '/'; } catch(e){} }
+
 /* ── 공용 랭킹 (서버) ──────────────────────────────────────
    세 게임이 같은 출처라서 nginx 를 건드릴 필요가 없다.
    /plane/ 프록시의 끝 슬래시가 접두사를 잘라내므로
@@ -1422,7 +1426,9 @@ function drawTitle(){
   y += 60;
   btn(LW/2 - 108, y, 216, 40, 'rank', '랭킹', false,
       ranks.length ? ('1위 ' + fmtDist(ranks[0].dist || 0)) : '기록 없음');
-  y += 54;
+  y += 48;
+  if (HAS_HOME){ btn(LW/2 - 78, y, 156, 32, 'home', '\u2190 게임 목록', false); y += 42; }
+  else y += 6;
 
   ctx.save();
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -1510,6 +1516,7 @@ function drawRank(){
   // 버튼은 항상 같은 자리 — 기록 수에 따라 움직이면 잘못 누르기 쉽다
   btn(LW/2 - 108, LH - 118, 216, 42, 'name', '이름 변경', false, '현재: ' + nick);
   btn(LW/2 - 108, LH - 62,  216, 44, 'close', '닫기', true);
+  if (HAS_HOME) btn(LW - 96, 18, 80, 28, 'home', '\u2190 목록', false);
 }
 
 // 충돌 순간만 짧게. 기록은 시작 화면에서 보여주므로 여기서 붙잡지 않는다.
@@ -1592,6 +1599,8 @@ function handleInput(){
       newRun(); state = S.PLAY;
     } else if (id === 'rank'){
       ranks = loadRanks(); Sound.ui(); state = S.RANK;
+    } else if (id === 'home'){
+      Sound.ui(); goHome();
     }
     return;
   }
@@ -1600,6 +1609,7 @@ function handleInput(){
     Input.consumeTap();
     if (id === 'close' || Input.wasPressed('PAUSE') || Input.wasPressed('OK')){ Sound.ui(); state = S.TITLE; }
     else if (id === 'name'){ Sound.ui(); openNick(); }
+    else if (id === 'home'){ Sound.ui(); goHome(); }
     return;
   }
   if (state === S.PLAY){

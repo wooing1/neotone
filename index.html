@@ -2631,6 +2631,10 @@ function updateParts(){
 }
 
 
+// 게임 목록(메인 화면)으로 나가기. file:// 로 직접 열었으면 돌아갈 곳이 없다.
+const HAS_HOME = (function(){ try { return location.protocol !== 'file:'; } catch(e){ return false; } })();
+function goHome(){ try { location.href = '/'; } catch(e){} }
+
 /* ── 공용 랭킹 (서버) ──────────────────────────────────────
    세 게임(줄넘기·탄막·자동차)이 같은 출처라 nginx 를 건드릴 필요가 없다.
    이 게임은 이미 /plane/ 아래에 있으므로 그대로 릴레이 서버로 들어간다.
@@ -4247,6 +4251,7 @@ function drawModeSelect(t){
   btn(90, 306, 300, 62, 'host',  'CREATE ROOM','방을 만들고 코드를 공유 (최대 4인)', true, '#5cff9e');
   btn(90, 382, 300, 62, 'join',  'JOIN ROOM',  '친구가 준 4자리 코드로 참가', true, '#ffd23d');
   btn(150, 470, 180, 40, 'back', 'BACK', '', false);
+  if (HAS_HOME) btn(150, 522, 180, 34, 'home', '\u2190 게임 목록', '', false);
 
   if (Net.error){
     ctx.save(); ctx.textAlign='center'; ctx.fillStyle = '#ff6b6b';
@@ -4486,6 +4491,7 @@ function handleStateInput(){
     }
     else if (id === 'join'){ lobbyRole = 'joininput'; joinCode = ''; Net.error=''; state = S.LOBBY; Sound.ui(); }
     else if (id === 'back'){ state = S.TITLE; Sound.ui(); }
+    else if (id === 'home'){ Sound.ui(); goHome(); }
     return;
   }
 
