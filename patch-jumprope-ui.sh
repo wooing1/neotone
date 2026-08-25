@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 #
-# 게임 선택 화면에 서버 공용 랭킹을 붙인다.
+# 탭탭 줄넘기에 "게임 목록 / 랭킹" 바와 공용 랭킹 화면을 붙인다.
+#   (예전 patch-jumprope-home.sh 를 대체합니다 — 그걸 이미 돌렸어도 안전합니다)
 #
-#   bash patch-menu-rank.sh                     # /var/www/games/index.html
-#   bash patch-menu-rank.sh /경로/index.html
+#   bash patch-jumprope-ui.sh                      # /var/www/games/jumprope/index.html
+#   bash patch-jumprope-ui.sh /경로/index.html
 #
-# 기존 마크업·스타일을 건드리지 않고 필요한 것만 끼워 넣는다.
-# 이미 일부만 적용된 상태에서 다시 돌려도 빠진 카드만 채운다.
-# 원본은 index.html.bak.<날짜시각> 으로 백업한다.
+# 게임 마크업은 건드리지 않는다. 화면 위에 올리는 것만 추가한다.
 set -euo pipefail
-F="${1:-/var/www/games/index.html}"
+F="${1:-/var/www/games/jumprope/index.html}"
 [ -f "$F" ] || { echo "파일을 찾을 수 없습니다: $F"; exit 1; }
 BAK="$F.bak.$(date +%Y%m%d-%H%M%S)"
 cp -a "$F" "$BAK"
@@ -18,196 +17,10 @@ python3 - "$F" <<'PYEOF'
 import io, re, sys
 path = sys.argv[1]
 src = io.open(path, encoding='utf-8').read()
+if '</body>' not in src:
+    print('  ✗ </body> 를 찾지 못했습니다.'); sys.exit(2)
 
-# ── 1. 카드 찾기.
-#     속성 순서를 가정하지 않는다. class="card" 인 <a> 를 전부 찾고 그 안에서 href 를 뽑는다.
-#     (이전 버전은 href 가 class 보다 앞에 오는 형태만 찾아서, 그 형태인 카드 하나에만 들어갔다)
-QQ = chr(34) + chr(39)                      # " 와 '
-HREF = re.compile('href=[' + QQ + ']/([a-z]+)/[' + QQ + ']')
-cards = []
-for m in re.finditer(r'<a\b[^>]*>[\s\S]*?</a>', src):
-    block = m.group(0)
-    if 'class="card"' not in block and "class='card'" not in block:
-        continue
-    hm = HREF.search(block)
-    if not hm:
-        continue
-    cards.append((m, hm.group(1)))
-
-if not cards:
-    print('  ✗ 카드(<a class="card" href="/게임/">)를 찾지 못했습니다.')
-    sys.exit(2)
-
-todo = [(m, k) for (m, k) in cards if 'data-g=' not in m.group(0)]
-
-out, last, found = [], 0, []
-for m, key in todo:
-    block = m.group(0)
-    ins = '<div class="rk" data-g="' + key + '"><div class="rkw">기록 불러오는 중…</div></div>'
-    mp = list(re.finditer(r'</p>', block))
-    if mp:
-        at = mp[-1].end()
-        nb = block[:at] + ins + block[at:]
-    else:
-        nb = block[:-4] + ins + '</a>'
-    out.append(src[last:m.start()]); out.append(nb); last = m.end()
-    found.append(key)
-out.append(src[last:])
-src = ''.join(out)
-
-CSS = """
-<style>
-/* arcade-rank */
-.rk{margin-top:10px;border-top:1px solid rgba(128,128,128,.22);padding-top:8px}
-.rk .rkw{font-size:11px;opacity:.45}
-.rk ol{list-style:none;margin:0;padding:0}
-.rk li{display:flex;align-items:baseline;gap:6px;font-size:12px;line-height:1.75;opacity:.85}
-.rk li .n{width:1.1em;text-align:right;opacity:.5;font-variant-numeric:tabular-nums}
-.rk li.me{opacity:1;font-weight:700}
-.rk li .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rk li .sc{font-variant-numeric:tabular-nums;white-space:nowrap}
-.rk li .sb{font-size:10px;opacity:.5;white-space:nowrap}
-.rk li.gold .n{opacity:1;color:#e8b62c}
-#namebar{display:flex;align-items:center;justify-content:center;gap:8px;
-  margin:10px 0 4px;font-size:12px;opacity:.75;flex-wrap:wrap}
-#namebar input{font:inherit;font-size:12px;width:8.5em;padding:4px 8px;border-radius:6px;
-  border:1px solid rgba(128,128,128,.4);background:rgba(128,128,128,.10);color:inherit;text-align:center}
-#namebar button{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;cursor:pointer;
-  border:1px solid rgba(128,128,128,.4);background:rgba(128,128,128,.10);color:inherit}
-#namebar .ok{color:#3aa76d}
-</style>
-"""
-
-NAMEBAR = """
-<div id="namebar">
-  <span>랭킹에 쓸 이름</span>
-  <input id="nmi" maxlength="8" placeholder="이름 (8자)" autocomplete="off" spellcheck="false">
-  <button id="nmb" type="button">저장</button>
-  <span id="nmok" class="ok"></span>
-</div>
-"""
-
-JS = """
-<script>
-/* arcade-rank — 서버 공용 랭킹을 카드에 채운다.
-   중요: 이름은 사람이 넣는 값이다. 절대 innerHTML 로 그리지 않는다.
-   세 게임이 같은 출처라, 여기서 XSS 가 터지면 세 게임의 localStorage 가 전부 털린다. */
-(function(){
-  'use strict';
-  var API = '/plane/api/rank';
-  function ls(k, v){
-    try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); }
-    catch(e){ return null; }
-  }
-  var uid = ls('arcade-uid');
-  if (!uid){
-    uid = Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4);
-    ls('arcade-uid', uid);
-  }
-
-  // 이름 입력
-  var nmi = document.getElementById('nmi');
-  var nmb = document.getElementById('nmb');
-  var nmok = document.getElementById('nmok');
-  if (nmi){
-    nmi.value = ls('arcade-name') || ls('overtake-name') || '';
-    var save = function(){
-      var v = (nmi.value || '').trim().slice(0, 8);
-      ls('arcade-name', v);
-      ls('overtake-name', v);            // 자동차 게임이 쓰던 키도 같이 맞춰 준다
-      nmok.textContent = '저장됨';
-      setTimeout(function(){ nmok.textContent = ''; }, 1500);
-    };
-    nmb.addEventListener('click', save);
-    nmi.addEventListener('keydown', function(e){ if (e.key === 'Enter') save(); });
-  }
-
-  function row(e, mine){
-    var li = document.createElement('li');
-    if (e.r === 1) li.className = 'gold';
-    if (mine) li.className += ' me';
-    var n = document.createElement('span'); n.className = 'n'; n.textContent = e.r;
-    var nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = e.name;   // textContent
-    var sc = document.createElement('span'); sc.className = 'sc'; sc.textContent = e.disp;
-    li.appendChild(n); li.appendChild(nm);
-    if (e.sub){ var sb = document.createElement('span'); sb.className = 'sb'; sb.textContent = e.sub; li.appendChild(sb); }
-    li.appendChild(sc);
-    return li;
-  }
-  function fill(box, g){
-    box.textContent = '';
-    if (!g || !g.top || !g.top.length){
-      var d = document.createElement('div'); d.className = 'rkw';
-      d.textContent = '아직 기록이 없습니다 — 1등 하세요';
-      box.appendChild(d); return;
-    }
-    var ol = document.createElement('ol');
-    for (var i = 0; i < g.top.length; i++) ol.appendChild(row(g.top[i], g.top[i].uid === uid));
-    box.appendChild(ol);
-    if (g.me && g.me.rank > g.top.length){
-      var d2 = document.createElement('div'); d2.className = 'rkw';
-      d2.textContent = '내 기록 ' + g.me.rank + '위 · ' + g.me.disp;
-      box.appendChild(d2);
-    }
-  }
-  function load(){
-    var boxes = document.querySelectorAll('.rk');
-    fetch(API + '?n=3&uid=' + encodeURIComponent(uid), { cache: 'no-store' })
-      .then(function(r){ return r.json(); })
-      .then(function(d){
-        if (!d || !d.ok) throw new Error('bad');
-        for (var i = 0; i < boxes.length; i++)
-          fill(boxes[i], d.games[boxes[i].getAttribute('data-g')]);
-      })
-      .catch(function(){
-        // 서버가 죽어도 메뉴는 떠야 한다. 카드 자체는 그대로 눌린다.
-        for (var i = 0; i < boxes.length; i++){
-          boxes[i].textContent = '';
-          var d = document.createElement('div'); d.className = 'rkw';
-          d.textContent = '랭킹 서버에 연결하지 못했습니다';
-          boxes[i].appendChild(d);
-        }
-      });
-  }
-  load();
-  // 게임을 하고 뒤로 돌아왔을 때 최신 기록이 보이게
-  document.addEventListener('visibilitychange', function(){ if (!document.hidden) load(); });
-})();
-</script>
-"""
-
-# 스타일/이름줄/스크립트는 이미 있으면 건너뛴다 (부분 적용 상태에서 다시 돌릴 수 있게)
-if '/* arcade-rank */' not in src:
-    src = src.replace('</head>', CSS + '</head>', 1) if '</head>' in src else CSS + src
-
-if 'id="namebar"' not in src:
-    first = None
-    for m in re.finditer(r'<a\b[^>]*>', src):
-        seg = src[m.start():m.start()+400]
-        if 'class="card"' in seg or "class='card'" in seg:
-            first = m; break
-    if first: src = src[:first.start()] + NAMEBAR + src[first.start():]
-
-# 예전에 넣은 블록은 걷어내고 항상 최신판을 다시 넣는다.
-# '이미 있으니 넘어감' 으로 두면 이 스크립트를 새로 받아도 옛날 코드가 그대로 남는다.
-n_up = 0
-def strip_block(text, tag):
-    # 블록은 <style>…</style><div>…</div><script>…</script> 통짜이거나 <script> 하나뿐이다.
-    # <style> 형태를 먼저 시도해야 한다 — <script> 부터 지우면 앞의 스타일/마크업이 남는다.
-    global n_up
-    hit = False
-    for pre in ('<style>', '<script>'):
-        while tag in text:
-            t2 = re.sub(r'\n?' + pre + r'\s*/\* ' + tag + r'[\s\S]*?</script>\s*', '\n', text, count=1)
-            if t2 == text: break
-            text = t2; hit = True
-    if hit: n_up += 1
-    return text
-
-src = strip_block(src, 'arcade-rank —')
-src = src.replace('</body>', JS + '</body>', 1) if '</body>' in src else src + JS
-
-OVERLAY = """<style>
+OV  = """<style>
 /* arcade-rankui — 세 게임 + 메인이 공유하는 랭킹 화면 */
 #arkWrap{position:fixed;inset:0;z-index:99999;display:none;
   background:rgba(6,9,14,.90);backdrop-filter:blur(6px);
@@ -403,35 +216,91 @@ OVERLAY = """<style>
 </script>
 """
 
-MOREBTN = """
-<div style="text-align:center;margin:14px 0 2px">
-  <button id="arkMore" type="button" style="font:600 12px/1 system-ui,-apple-system,sans-serif;
-    color:inherit;background:rgba(128,128,128,.12);border:1px solid rgba(128,128,128,.38);
-    border-radius:20px;padding:9px 16px;cursor:pointer">전체 랭킹 보기 (TOP 10)</button>
-</div>
+BAR = """<style>
+/* arcade-bar — 세 게임 공통 상단 바 (목록 / 랭킹). 플레이 중에는 숨는다. */
+#arkBar{position:fixed;left:0;top:0;z-index:9998;display:none;gap:7px;
+  padding:calc(8px + env(safe-area-inset-top,0px)) 0 0 calc(8px + env(safe-area-inset-left,0px))}
+#arkBar.on{display:flex}
+#arkBar a,#arkBar button{
+  display:inline-block;text-decoration:none;cursor:pointer;
+  font:600 12px/1 system-ui,-apple-system,'Apple SD Gothic Neo',sans-serif;
+  color:#dfe6ef;background:rgba(18,22,30,.82);border:1px solid rgba(255,255,255,.22);
+  border-radius:20px;padding:9px 14px;-webkit-tap-highlight-color:transparent;
+  backdrop-filter:blur(4px)}
+#arkBar a:active,#arkBar button:active{background:rgba(44,50,62,.94)}
+</style>
+<div id="arkBar"><a id="arkHome" href="/">← 목록</a><button id="arkRank" type="button">랭킹</button></div>
 <script>
+/* arcade-bar — 게임 목록으로 돌아가기 + 랭킹 열기.
+   캔버스 화면마다 버튼을 그리는 대신 DOM 으로 한 번만 둔다 —
+   어느 화면에 있든 같은 자리에 있고, 세 게임이 똑같이 동작한다.
+   플레이 중에는 숨긴다. 안 그러면 조작하다 실수로 눌러 게임이 날아간다. */
 (function(){
-  var b = document.getElementById('arkMore');
-  if (b) b.addEventListener('click', function(){ if (window.ArcadeRankUI) window.ArcadeRankUI.open(); });
+  'use strict';
+  var bar = document.getElementById('arkBar');
+  if (!bar) return;
+  try { if (location.protocol === 'file:'){ bar.remove(); return; } } catch(e){ return; }
+
+  document.getElementById('arkRank').addEventListener('click', function(){
+    if (window.ArcadeRankUI) window.ArcadeRankUI.open();
+  });
+
+  // 플레이 중인가? 게임마다 알아내는 방법이 다르다.
+  var TITLE_IDS = ['titleScreen', 'title', 'menuScreen', 'startScreen'];
+  function playing(){
+    try {
+      if (window.__race && window.__race.state) return window.__race.state === 'PLAY';
+      // 탄막 게임은 __game.state 로 노출한다 (screen 이 아니다). PAUSE 는 바를 보여 준다 —
+      // 멈춰 있을 때 목록으로 나갈 길이 있어야 한다.
+      var gs = window.__game && (window.__game.state || window.__game.screen);
+      if (gs) return String(gs) === 'PLAY';
+    } catch(e){}
+    // DOM 기반 게임(줄넘기): 타이틀 화면이 보이면 플레이 중이 아니다
+    var found = false;
+    for (var i = 0; i < TITLE_IDS.length; i++){
+      var t = document.getElementById(TITLE_IDS[i]);
+      if (!t) continue;
+      found = true;
+      try { if (getComputedStyle(t).display !== 'none' && t.offsetParent !== null) return false; }
+      catch(e){}
+    }
+    return found ? true : false;    // 판단 근거가 없으면 '플레이 중 아님' 으로 본다 (보여 준다)
+  }
+  function tick(){
+    var hideIt = playing() || (window.ArcadeRankUI && window.ArcadeRankUI.isOpen());
+    bar.classList.toggle('on', !hideIt);
+  }
+  tick();
+  setInterval(tick, 350);
 })();
 </script>
 """
 
-src = strip_block(src, 'arcade-rankui')
-if 'arcade-rankui' in src:
-    print('  ✗ 예전 랭킹 화면 블록을 걷어내지 못했습니다. 백업본으로 되돌린 뒤 알려 주세요.')
-    sys.exit(3)
-src = src.replace('</body>', OVERLAY + '</body>', 1) if '</body>' in src else src + OVERLAY
-if 'arkMore' not in src:
-    # 마지막 카드 뒤에 넣는다
-    last = None
-    for m in re.finditer(r'</a>', src): last = m
-    if last: src = src[:last.end()] + MOREBTN + src[last.end():]
+# 예전 patch-jumprope-home.sh 가 넣은 블록이 있으면 걷어낸다 (바가 대신한다)
+n_old = 0
+if 'arcade-home' in src:
+    src2 = re.sub(r'\n?<style>\s*/\* arcade-home \*/[\s\S]*?</script>\s*', '\n', src, count=1)
+    if src2 != src:
+        src = src2; n_old = 1
 
+# 예전에 넣은 블록이 있으면 걷어내고 항상 최신판을 다시 넣는다.
+# '이미 있으니 넘어감' 으로 두면 이 스크립트를 새로 받아도 옛날 블록이 그대로 남는다.
+n_up = 0
+for tag in ('arcade-rankui', 'arcade-bar'):
+    if tag not in src: continue
+    src2 = re.sub(r'\n?<style>\s*/\* ' + tag + r'[\s\S]*?</script>\s*', '\n', src, count=1)
+    if src2 != src:
+        src = src2; n_up += 1
+
+if 'arcade-rankui' in src or 'arcade-bar' in src:
+    print('  ✗ 예전 블록을 걷어내지 못했습니다. 백업본으로 되돌린 뒤 알려 주세요.')
+    sys.exit(3)
+
+src = src.replace('</body>', OV + BAR + '</body>', 1)
 io.open(path, 'w', encoding='utf-8').write(src)
-print('  ✓ {0} — 이번에 붙인 카드: {1} / 전체 카드 {2}개'.format(
-      '최신판으로 교체했습니다' if n_up else '적용 완료',
-      ', '.join(found) if found else '(이미 붙어 있음)', len(cards)))
+print('  ✓ {0} — 좌측 상단에 [← 목록] [랭킹] 이 생깁니다.'.format(
+      '최신판으로 교체했습니다' if n_up else '적용 완료')
+      + (' (옛 링크는 제거했습니다)' if n_old else ''))
 PYEOF
 
 RC=$?
