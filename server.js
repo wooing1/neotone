@@ -38,15 +38,174 @@ const MAX_ROOMS   = parseInt(process.env.NEOTONE_MAX_ROOMS   || '16', 10);
 let sockCount = 0;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';   // RFC 6455
 
+/* ══════════════════════════════════════════════════════════
+   공용 랭킹
+   ══════════════════════════════════════════════════════════
+   세 게임(줄넘기·탄막·자동차)이 같은 출처라 nginx 를 건드릴 필요가 없다.
+   `proxy_pass http://127.0.0.1:9000/` 의 끝 슬래시가 /plane/ 접두사를 잘라내므로
+   게임에서 /plane/api/rank 를 부르면 여기로 /api/rank 로 들어온다.
+   (끝 슬래시가 언젠가 지워져도 안 깨지게 두 형태를 모두 받는다)
+
+   불변식 하나: score 는 항상 정수이고 항상 클수록 좋다.
+   단위가 다른 세 게임은 제출 시점에 각자 이 축으로 변환해서 보낸다. */
+
+// 게임 화이트리스트. 이 표가 세 가지를 겸한다:
+//   ① 표시 포맷(클라이언트에 게임별 코드가 0줄이 된다)
+//   ② 모르는 game 키를 400 으로 거절 → 파일이 무한히 커지는 것을 막는다
+//   ③ 게임별 점수 상한 (999999 같은 무성의한 위조를 거른다)
+const GAMES = {
+  jumprope: { label: '탭탭 줄넘기', unit: '점', max: 1000000, sub: [['combo','콤보']] },
+  plane:    { label: 'NEOTONE',    unit: '점', max: 200000000, sub: [['stage','ST']] },
+  race:     { label: '쌩쌩 추월',  unit: 'm',  max: 20000,     sub: [['overtakes','추월']] },
+};
+const KEEP = 20;                       // 게임당 보관 건수
+
+// 데이터는 게임 코드 밖에 둔다. /opt/neotone 안에 두면 재배포 때 함께 날아갈 수 있다.
+const DATA_DIR = process.env.NEOTONE_DATA || '/var/lib/neotone';
+let RANK_FILE = path.join(DATA_DIR, 'ranks.json');
+let ranks = { v: 1, games: { jumprope: [], plane: [], race: [] } };
+
+(function initRanks(){
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); }
+  catch (e){
+    // 어떤 경우에도 여기서 죽으면 안 된다 — 랭킹 때문에 4인 릴레이가 못 뜨면 본말전도다
+    RANK_FILE = path.join(__dirname, 'ranks.json');
+    console.log('  ! 랭킹 디렉터리를 만들지 못해 ' + RANK_FILE + ' 로 대체합니다: ' + e.message);
+  }
+  try {
+    const raw = fs.readFileSync(RANK_FILE, 'utf8');
+    const o = JSON.parse(raw);
+    if (o && o.games) for (const g of Object.keys(ranks.games))
+      if (Array.isArray(o.games[g])) ranks.games[g] = o.games[g];
+  } catch (e){
+    if (e.code !== 'ENOENT'){
+      // 깨진 파일을 덮어쓰기 전에 옆으로 치워 둔다
+      try { fs.renameSync(RANK_FILE, RANK_FILE + '.bad.' + Date.now()); } catch(e2){}
+      console.log('  ! 랭킹 파일을 읽지 못해 새로 시작합니다: ' + e.message);
+    }
+  }
+})();
+
+// 저장은 원자적으로. 반쪽짜리 파일이 남으면 다음 부팅에서 전부 잃는다.
+let saveTimer = null;
+function saveRanksNow(){
+  saveTimer = null;
+  const tmp = RANK_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(ranks), 'utf8');
+    fs.renameSync(tmp, RANK_FILE);
+  } catch (e){
+    console.log('  ! 랭킹 저장 실패: ' + e.message);
+    try { fs.unlinkSync(tmp); } catch(e2){}
+  }
+}
+// 연속 제출을 1초로 묶는다 (디스크 쓰기가 릴레이 루프를 방해하지 않게)
+function saveRanks(){ if (!saveTimer) saveTimer = setTimeout(saveRanksNow, 1000); }
+process.on('SIGTERM', () => { if (saveTimer){ clearTimeout(saveTimer); saveRanksNow(); } process.exit(0); });
+process.on('SIGINT',  () => { if (saveTimer){ clearTimeout(saveTimer); saveRanksNow(); } process.exit(0); });
+
+function cleanName(v){
+  let n = String(v == null ? '' : v).normalize('NFC');
+  n = n.replace(/[^\p{L}\p{N} _\-.!?]/gu, '').trim().slice(0, 8);
+  return n || '익명';
+}
+function fmtScore(g, score){
+  if (g === 'race') return score >= 1000 ? (score/1000).toFixed(2) + ' km' : score + ' m';
+  return score.toLocaleString('en-US') + ' ' + GAMES[g].unit;
+}
+function viewEntry(g, e, i){
+  const sub = [];
+  for (const [k, lbl] of GAMES[g].sub)
+    if (e.meta && e.meta[k] != null) sub.push(lbl + ' ' + e.meta[k]);
+  return { r: i + 1, uid: e.uid, name: e.name, score: e.score,
+           disp: fmtScore(g, e.score), sub: sub.join(' · '), ts: e.ts };
+}
+function topOf(g, n, uid){
+  const list = ranks.games[g] || [];
+  const out = { label: GAMES[g].label, unit: GAMES[g].unit, total: list.length,
+                top: list.slice(0, n).map((e, i) => viewEntry(g, e, i)), me: null };
+  if (uid){
+    const i = list.findIndex(e => e.uid === uid);
+    if (i >= 0) out.me = { rank: i + 1, score: list[i].score, disp: fmtScore(g, list[i].score) };
+  }
+  return out;
+}
+
+// 쿨다운 (도배 방지). Map 이 무한히 커지지 않게 상한을 둔다.
+// 키는 uid + 게임이다 — uid 만으로 잠그면 자동차를 끝내고 3초 안에 줄넘기를 끝낸 기록이
+// 조용히 사라진다 (실제로 테스트에서 그렇게 한 건을 잃었다).
+const cooldown = new Map();
+function tooSoon(uid){
+  const now = Date.now(), last = cooldown.get(uid);
+  if (last && now - last < 3000) return true;
+  if (cooldown.size > 200) cooldown.clear();
+  cooldown.set(uid, now);
+  return false;
+}
+
+function submitRank(d){
+  const g = String(d.game || '');
+  if (!GAMES[g]) return { ok: false, err: 'unknown game' };
+  const score = Math.round(Number(d.score));
+  if (!isFinite(score) || score < 0 || score > GAMES[g].max) return { ok: false, err: 'bad score' };
+  const uid = String(d.uid || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24) || 'anon';
+  if (tooSoon(uid + '|' + g)) return { ok: false, err: 'too soon' };
+
+  let meta = {};
+  try { const j = JSON.stringify(d.meta || {}); if (j.length <= 200) meta = JSON.parse(j); } catch(e){}
+
+  const list = ranks.games[g];
+  const name = cleanName(d.name);
+  const prev = list.findIndex(e => e.uid === uid);
+  let best = true;
+  if (prev >= 0){
+    // uid 당 1건만 둔다 — 한 명이 열 칸을 다 먹는 것도, 도배로 파일이 커지는 것도 막는다
+    if (list[prev].score >= score){ list[prev].name = name; best = false; }
+    else list[prev] = { uid, name, score, ts: Date.now(), meta };
+  } else {
+    list.push({ uid, name, score, ts: Date.now(), meta });
+  }
+  list.sort((a, b) => (b.score - a.score) || (a.ts - b.ts));
+  if (list.length > KEEP) list.length = KEEP;
+  saveRanks();
+
+  const rank = list.findIndex(e => e.uid === uid);
+  console.log('[' + new Date().toTimeString().slice(0,8) + '] ' + g + ' — ' +
+              name + ' ' + fmtScore(g, score) + (rank >= 0 ? ' (' + (rank+1) + '위)' : ''));
+  return { ok: true, rank: rank >= 0 ? rank + 1 : null, best, n: list.length,
+           unit: GAMES[g].unit, top: list.slice(0, 10).map((e, i) => viewEntry(g, e, i)) };
+}
+
+function readBody(req, cb){
+  let n = 0; const chunks = []; let done = false;
+  const finish = (e, s) => { if (done) return; done = true; cb(e, s); };
+  req.on('data', c => {
+    n += c.length;
+    if (n > 2048){ finish(new Error('too large')); try { req.destroy(); } catch(e){} return; }
+    chunks.push(c);
+  });
+  req.on('end', () => finish(null, Buffer.concat(chunks).toString('utf8')));
+  req.on('error', e => finish(e));
+}
+
 /* ── index.html 서빙 (릴레이 사용 표시를 끼워 넣는다) ── */
 const HTML_PATH = path.join(__dirname, 'index.html');
+// 매 요청마다 275KB 를 동기로 읽고 정규식까지 돌리던 것을 mtime 캐시로 바꾼다.
+// 파일을 바꾸면 mtime 이 달라지므로 재시작 없이 반영된다.
+let pageCache = { mtime: 0, size: -1, body: null };
 function pageHtml(){
+  const st = fs.statSync(HTML_PATH);
+  const mt = st.mtimeMs;
+  if (pageCache.body !== null && pageCache.mtime === mt && pageCache.size === st.size)
+    return pageCache.body;
   let html = fs.readFileSync(HTML_PATH, 'utf8');
   // 주의: 게임 코드 안에도 __NEOTONE_WS 라는 이름이 나온다.
   // 그래서 "이미 끼워 넣었는지"는 주입 표시 전체로 판별해야 한다.
   const flag = '<script>window.__NEOTONE_WS=1;/*neotone-relay*/</script>';
-  if (html.includes('/*neotone-relay*/')) return html;
-  return html.replace(/<head[^>]*>/i, m => m + flag);
+  if (!html.includes('/*neotone-relay*/'))
+    html = html.replace(/<head[^>]*>/i, m => m + flag);
+  pageCache = { mtime: mt, size: st.size, body: html };
+  return html;
 }
 
 const server = http.createServer((req, res) => {
@@ -65,10 +224,51 @@ const server = http.createServer((req, res) => {
     }
     return;
   }
+  // ── 공용 랭킹.  /api/rank  또는  /plane/api/rank  둘 다 받는다
+  //    (nginx 가 접두사를 잘라 주지만, 그 설정이 바뀌어도 안 깨지게)
+  if (/^\/(?:plane\/)?api\/rank(\?|$)/.test(req.url || '')){
+    const json = (code, o) => {
+      res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8',
+                            'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(o));
+    };
+    if (req.method === 'POST'){
+      readBody(req, (err, body) => {
+        if (err) return json(413, { ok: false, err: 'too large' });
+        let d; try { d = JSON.parse(body || '{}'); } catch(e){ return json(400, { ok:false, err:'bad json' }); }
+        const r = submitRank(d);
+        json(r.ok ? 200 : 400, r);
+      });
+      return;
+    }
+    if (req.method !== 'GET') return json(405, { ok: false, err: 'method' });
+    const q = {};
+    const qs = (req.url.split('?')[1] || '');
+    for (const kv of qs.split('&')){
+      if (!kv) continue;
+      const i = kv.indexOf('=');
+      const k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i));
+      const v = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1));
+      q[k] = v;
+    }
+    const n = Math.max(1, Math.min(20, parseInt(q.n, 10) || 3));
+    const uid = String(q.uid || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24);
+    if (q.game){
+      if (!GAMES[q.game]) return json(400, { ok: false, err: 'unknown game' });
+      return json(200, { ok: true, game: q.game, ...topOf(q.game, n, uid) });
+    }
+    const out = {};
+    for (const g of Object.keys(GAMES)) out[g] = topOf(g, n, uid);
+    return json(200, { ok: true, ts: Date.now(), games: out });
+  }
+
   if (/\/health(\?|$)/.test(req.url || '')){
+    const rc = {};
+    for (const g of Object.keys(GAMES)) rc[g] = (ranks.games[g] || []).length;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, rooms: rooms.size, sockets: sockCount,
-                             maxSockets: MAX_SOCKETS, maxRooms: MAX_ROOMS }));
+                             maxSockets: MAX_SOCKETS, maxRooms: MAX_ROOMS,
+                             pid: process.pid, data: RANK_FILE, ranks: rc }));
     return;
   }
   try {

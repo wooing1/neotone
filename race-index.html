@@ -167,6 +167,10 @@ function onDown(id, cx, cy){
   syncTouches();
   Input.tapAnywhere = true;
   Input.tapPos = { x: p.x, y: p.y };
+  // iOS 는 사용자 제스처와 "같은 틱"에서 focus() 를 불러야 키보드를 올린다.
+  // handleInput() 은 다음 rAF 에서 도니까 거기서 openNick() 을 부르면 이미 늦다.
+  // (이 파일에도 그렇게 적혀 있었지만 실제 호출 경로는 rAF 안이었다 — 여기서 직접 연다.)
+  if (state === S.RANK && uiHit(p) === 'name') openNick();
 }
 function onMove(id, cx, cy){
   const t = touches.get(id);
@@ -187,7 +191,13 @@ cv.addEventListener('touchend',   e => { e.preventDefault();
   for (const t of e.changedTouches) onUp(t.identifier); }, {passive:false});
 cv.addEventListener('touchcancel',e => { e.preventDefault();
   for (const t of e.changedTouches) onUp(t.identifier); }, {passive:false});
-cv.addEventListener('mousedown',  e => onDown('m', e.clientX, e.clientY));
+cv.addEventListener('mousedown',  e => {
+  onDown('m', e.clientX, e.clientY);
+  // onDown 이 이름 입력창을 열었다면 기본 동작을 막는다.
+  // 안 막으면 브라우저가 포커스를 캔버스로 가져가면서 곧바로 blur 가 터지고,
+  // blur 커밋이 빈 값으로 이름을 덮어쓴다. (터치 경로는 이미 preventDefault 라 무사했다)
+  if (nickOpen) e.preventDefault();
+});
 addEventListener('mousemove',     e => onMove('m', e.clientX, e.clientY));
 addEventListener('mouseup',       () => onUp('m'));
 
@@ -405,6 +415,43 @@ function uiHit(pt){
   return null;
 }
 
+
+/* ── 공용 랭킹 (서버) ──────────────────────────────────────
+   세 게임이 같은 출처라서 nginx 를 건드릴 필요가 없다.
+   /plane/ 프록시의 끝 슬래시가 접두사를 잘라내므로
+   /plane/api/rank 로 보내면 릴레이 서버의 /api/rank 로 들어간다.
+   실패해도 게임은 그대로 돌아야 한다 — 전부 삼킨다. */
+const Rank = (function(){
+  const API = '/plane/api/rank';
+  let uid = '';
+  try {
+    uid = localStorage.getItem('arcade-uid') || '';
+    if (!uid){
+      uid = Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+      localStorage.setItem('arcade-uid', uid);
+    }
+  } catch(e){ uid = 'anon'; }
+  function who(){
+    try { return localStorage.getItem('arcade-name') || localStorage.getItem('overtake-name') || ''; }
+    catch(e){ return ''; }
+  }
+  return {
+    uid: uid,
+    get name(){ return who(); },
+    submit(game, score, meta){
+      try {
+        // file:// 로 직접 열었을 때는 보낼 곳이 없다 (README 가 안내하는 오프라인 플레이).
+        // 그냥 두면 콘솔이 CORS 에러로 가득 찬다.
+        if (location.protocol === 'file:') return Promise.resolve(null);
+        return fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ game: game, score: Math.round(score), name: who(),
+                                 uid: uid, meta: meta || {} }) })
+          .then(r => r.json()).catch(function(){ return null; });
+      } catch(e){ return Promise.resolve(null); }
+    },
+  };
+})();
+
 /* ── 랭킹 (이 브라우저에 저장) ── */
 const RANK_MAX = 10;
 function loadRanks(){
@@ -430,7 +477,8 @@ let nick = (function(){
 })();
 function setNick(v){
   nick = (v || '').trim().slice(0, 8) || '나';
-  try { localStorage.setItem('overtake-name', nick); } catch(e){}
+  // arcade-name 은 세 게임이 공유하는 키다 (탄막게임엔 이름 입력 UI 가 아예 없다)
+  try { localStorage.setItem('overtake-name', nick); localStorage.setItem('arcade-name', nick); } catch(e){}
 }
 
 /* ── 이름 입력 ──
@@ -1014,6 +1062,12 @@ function crash(c){
   lastRun.newBest = G.newBest;
   myRankIdx = addRank({ dist: d, sec: t, overtakes: G.overtakes, nearMiss: G.nearMiss,
                         name: nick, ts: Date.now() });
+  // 서버 공용 랭킹에도 올린다. 단위는 내부 유닛이 아니라 미터여야 다른 게임과 축이 맞는다.
+  // 한 판에 한 번만 (crash 가 두 번 불리는 경로를 대비).
+  if (!G._sent){
+    G._sent = 1;
+    Rank.submit('race', d * M_PER_UNIT, { sec: +t.toFixed(1), overtakes: G.overtakes, nearMiss: G.nearMiss });
+  }
   lastRun.rank = myRankIdx;
   overTick = 100;              // 약 1.7초 충돌 장면을 보여준 뒤 결과 화면으로
   state = S.OVER;
