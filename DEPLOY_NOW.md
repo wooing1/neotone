@@ -1,4 +1,4 @@
-# 배포 명령 — 2026-08-25 (2차: 목록으로 돌아가기 + 통합 랭킹 화면)
+# 배포 명령 — 2026-08-25 (2차: 목록 바 + 통합 랭킹 + 아슬아슬 점수 반영)
 
 서버에 SSH 로 들어가서 **root** 로 아래를 순서대로 실행하세요.
 전부 백업을 남기고, 여러 번 돌려도 안전합니다.
@@ -7,7 +7,7 @@
 직전 버전이 내려올 수 있어서, 방금 올린 커밋 해시를 직접 지정합니다.
 
 ```bash
-R=https://raw.githubusercontent.com/wooing1/neotone/c680ce9
+R=https://raw.githubusercontent.com/wooing1/neotone/61e189c
 TS=$(date +%Y%m%d-%H%M%S)
 ```
 
@@ -18,6 +18,11 @@ TS=$(date +%Y%m%d-%H%M%S)
   메인화면과 세 게임 어디서든 같은 화면이 뜹니다
 - 랭킹 이름 입력칸 글꼴 16px — iOS 가 포커스 시 페이지를 확대하던 문제 (캔버스 게임엔 치명적)
 - 자동차 게임 타이틀에 `내 기록` 버튼 분리 (`랭킹` 은 통합 화면)
+- **쌩쌩 추월 — 아슬아슬이 기록에 반영됩니다.** 지금까지는 세기만 하고 점수에 1미터도
+  안 붙었습니다. 이제 스칠 때마다 보너스 거리가 붙고, 빠를수록(최대 x2.2) ·
+  연속으로 스칠수록(최대 x2.0) 커집니다. 기록 = 주행거리 + 아슬아슬 보너스
+- 쌩쌩 추월 계기판이 1 km 를 넘어도 1 m 단위로 표시됩니다 (전에는 10 m 단위로 뭉개져서
+  제일 빠를 때 오히려 숫자가 느리게 도는 것처럼 보였습니다)
 
 > **패치 스크립트가 바뀌었습니다.** 이제 이미 적용된 상태에서 다시 돌리면
 > 예전 블록을 걷어내고 **최신판으로 갈아 끼웁니다** (전에는 "이미 적용됨" 으로 건너뛰었습니다).
@@ -57,7 +62,7 @@ systemctl restart neotone
 ```bash
 cp -a /var/www/games/race/index.html /var/www/games/race/index.html.bak.$TS
 curl -fsSL -o /var/www/games/race/index.html $R/race-index.html
-wc -c /var/www/games/race/index.html          # 88049 바이트
+wc -c /var/www/games/race/index.html          # 95996 바이트
 ```
 
 ## 3. 메인화면 + 줄넘기
