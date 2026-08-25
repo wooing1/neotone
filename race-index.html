@@ -73,6 +73,25 @@ const CAR_R = 7, TRUCK_R = 5;              // bakeCar / bakeTruck 의 모서리 
 
 const NEAR_MISS_X = 26;                    // 이 안으로 스치면 아슬아슬 보너스
 
+/* ── 아슬아슬 보너스 ───────────────────────────────────────
+   지금까지 아슬아슬은 세고 보여 주기만 했고 기록에는 1미터도 반영되지 않았다.
+   즉 "안전하게 빈 차선만 달리기" 와 "차 사이를 스치며 뚫기" 가 완전히 같은 점수였다.
+   이제 스칠 때마다 보너스 거리를 준다. 두 가지로 배율이 붙는다.
+
+   ① 속도 — 360km/h 로 스치는 것과 112km/h 로 스치는 것은 위험이 다르다.
+      기본 속도에서 1.0, 최고 속도에서 SPD_SCALE 배.
+      가속이 거리(선형) 말고 보너스(추가)로도 값어치를 갖게 하는 장치다.
+   ② 콤보 — COMBO_HOLD 프레임 안에 다음 아슬아슬이 나오면 이어진다.
+      연속으로 뚫을수록 커져서, 한 번 위험한 라인에 들어가면 끝까지 갈 이유가 생긴다.
+
+   단위는 '유닛'(프레임당 이동량)이라 거리와 그대로 더할 수 있다.
+   NEAR_BASE = 160유닛 ≒ 12m. 최고 배율이면 한 번에 12 * 2.2 * 2.0 ≒ 53m. */
+const NEAR_BASE  = 160;                    // 유닛. 기본 속도·콤보 없음 = 약 12m
+const NEAR_SPD_SCALE = 2.2;                // 최고 속도에서의 배율
+const NEAR_COMBO_MAX = 10;                 // 콤보 상한
+const NEAR_COMBO_STEP = 0.1;               // 콤보 1당 +10%
+const COMBO_HOLD = 150;                    // 2.5초 안에 이어야 콤보 유지
+
 // 화면 위 가속 버튼 (▲). 모바일에서 끌면서 가속까지 하기 어려워 버튼을 따로 둔다.
 const GAS = { x: LW - 62, y: LH - 78, r: 40 };
 function inGas(x, y){ const dx = x - GAS.x, dy = y - GAS.y; return dx*dx + dy*dy < (GAS.r + 12) * (GAS.r + 12); }
@@ -471,7 +490,9 @@ let myRankIdx = -1;                 // 방금 넣은 기록의 순위 (하이라
 function addRank(entry){
   ranks = loadRanks();
   ranks.push(entry);
-  ranks.sort((a, b) => (b.dist || 0) - (a.dist || 0));
+  // 예전 기록(v2 초기)에는 score 가 없다 — 그 땐 주행거리가 곧 기록이었으니 dist 로 떨어진다.
+  const sk = r => (r.score != null ? r.score : (r.dist || 0));
+  ranks.sort((a, b) => sk(b) - sk(a));
   ranks = ranks.slice(0, RANK_MAX);
   saveRanks(ranks);
   return ranks.indexOf(entry);      // 10위 밖이면 -1
@@ -573,7 +594,12 @@ function newRun(){
     time: 0,               // 프레임
     overtakes: 0,
     nearMiss: 0,
-    dist: 0,
+    dist: 0,                 // 실제로 달린 거리 (유닛). 순수한 주행거리다.
+    bonus: 0,                // 아슬아슬 보너스 거리 (유닛)
+    combo: 0,                // 현재 아슬아슬 콤보
+    comboBest: 0,
+    comboT: 0,               // 콤보가 끊길 때까지 남은 프레임
+    pops: [],                // 화면에 띄우는 '+38m' 표시
     spawnTick: 8,
     wallTick: 0,
     oncTick: 0,
@@ -593,6 +619,17 @@ function newRun(){
 }
 
 const sec = () => G.time / 60;
+
+// 기록 = 주행거리 + 아슬아슬 보너스. 둘 다 유닛이라 그냥 더한다.
+const scoreOf = (g) => (g.dist || 0) + (g.bonus || 0);
+// 현재 속도의 보너스 배율 (기본 1.0 → 최고 NEAR_SPD_SCALE)
+function spdMul(){
+  const t = (player.spd - SPD_BASE) / (SPD_MAX - SPD_BASE);
+  return 1 + (NEAR_SPD_SCALE - 1) * Math.max(0, Math.min(1, t));
+}
+function comboMul(){
+  return 1 + Math.min(G.combo, NEAR_COMBO_MAX) * NEAR_COMBO_STEP;
+}
 
 /* ═══════════════════════════════════════════════════
    난이도 — 시간에 따라 값이 자란다
@@ -975,6 +1012,15 @@ function updateWorld(){
       // 판정 밖에서만 — 히트박스가 차체 그대로가 됐으니 경계도 정확히 (c.w+PLAYER.w)/2 다
       if (dy < (c.h + PLAYER.h) * 0.45 && dx < NEAR_MISS_X + (c.w + PLAYER.w) * 0.5 && dx >= (c.w + PLAYER.w) * 0.5){
         c.nearMissed = true; G.nearMiss++;
+        // 콤보는 '스친 것들 사이 간격' 으로 이어진다. 끊겼으면 1부터 다시.
+        G.combo = (G.comboT > 0) ? G.combo + 1 : 1;
+        G.comboT = COMBO_HOLD;
+        if (G.combo > G.comboBest) G.comboBest = G.combo;
+        const gain = NEAR_BASE * spdMul() * comboMul();
+        G.bonus += gain;
+        // 얼마 벌었는지 그 자리에 띄운다 — 안 보이면 없는 규칙이나 마찬가지다
+        G.pops.push({ x: c.x, y: c.y, m: gain * M_PER_UNIT, life: 46, combo: G.combo });
+        if (G.pops.length > 12) G.pops.shift();
         Sound.nearMiss();
         for (let q=0;q<4;q++)
           spawnPart(c.x + (player.x > c.x ? c.w*0.5 : -c.w*0.5), c.y + (Math.random()-0.5)*c.h,
@@ -1054,23 +1100,28 @@ function crash(c){
   for (let q=0;q<14;q++)
     spawnPart(player.x, player.y, (Math.random()-0.5)*3, (Math.random()-0.5)*3 + 1.5, 40, 'rgba(180,190,200,', 3);
 
-  const t = sec(), d = G.dist;
+  const t = sec(), d = G.dist, sc = scoreOf(G);
   lastRun = { sec: t, overtakes: G.overtakes, nearMiss: G.nearMiss,
-              dist: d, kmh: Math.round(player.spd * KMH), newBest: false };
-  G.newBest = d > bestDist;
+              dist: d, bonus: G.bonus, score: sc, comboBest: G.comboBest,
+              kmh: Math.round(player.spd * KMH), newBest: false };
+  // 최고 기록도 '기록'(주행+보너스) 기준이다. 주행거리만으로 재면
+  // 아슬아슬 보너스가 순위에는 들어가는데 BEST 에는 안 들어가 서로 어긋난다.
+  G.newBest = sc > bestDist;
   if (G.newBest){
-    bestDist = d; bestOver = G.overtakes;
-    try { localStorage.setItem('overtake-best-d', String(d)); localStorage.setItem('overtake-best-ot', String(G.overtakes)); } catch(e){}
+    bestDist = sc; bestOver = G.overtakes;
+    try { localStorage.setItem('overtake-best-d', String(sc)); localStorage.setItem('overtake-best-ot', String(G.overtakes)); } catch(e){}
     Sound.best();
   }
   lastRun.newBest = G.newBest;
-  myRankIdx = addRank({ dist: d, sec: t, overtakes: G.overtakes, nearMiss: G.nearMiss,
-                        name: nick, ts: Date.now() });
+  myRankIdx = addRank({ dist: d, bonus: G.bonus, score: sc, sec: t,
+                        overtakes: G.overtakes, nearMiss: G.nearMiss,
+                        combo: G.comboBest, name: nick, ts: Date.now() });
   // 서버 공용 랭킹에도 올린다. 단위는 내부 유닛이 아니라 미터여야 다른 게임과 축이 맞는다.
   // 한 판에 한 번만 (crash 가 두 번 불리는 경로를 대비).
   if (!G._sent){
     G._sent = 1;
-    Rank.submit('race', d * M_PER_UNIT, { sec: +t.toFixed(1), overtakes: G.overtakes, nearMiss: G.nearMiss });
+    Rank.submit('race', sc * M_PER_UNIT, { sec: +t.toFixed(1), overtakes: G.overtakes,
+                                           nearMiss: G.nearMiss, combo: G.comboBest });
   }
   lastRun.rank = myRankIdx;
   overTick = 100;              // 약 1.7초 충돌 장면을 보여준 뒤 결과 화면으로
@@ -1089,6 +1140,13 @@ function updateParts(){
 function updatePlay(){
   G.time++;
   if (G.banner > 0) G.banner--;
+  if (G.comboT > 0) G.comboT--;
+  else G.combo = 0;
+  for (let i = G.pops.length - 1; i >= 0; i--){
+    const q = G.pops[i];
+    q.y -= 1.1; q.life--;
+    if (q.life <= 0) G.pops.splice(i, 1);
+  }
   updatePlayer();
   updateWorld();
   collide();
@@ -1272,14 +1330,40 @@ function drawParts(){
   }
 }
 
+// 아슬아슬로 번 거리를 스친 자리에 띄운다
+function drawPops(){
+  if (!G || !G.pops.length) return;
+  ctx.save();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const q of G.pops){
+    const a = Math.min(1, q.life / 22);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = q.combo >= 5 ? '#ff9c7a' : '#ffe9a8';
+    ctx.font = 'bold 13px Menlo, monospace';
+    ctx.fillText('+' + Math.round(q.m) + 'm', q.x, q.y);
+    if (q.combo > 1){
+      ctx.font = 'bold 9px Menlo, monospace';
+      ctx.fillStyle = 'rgba(255,233,168,0.8)';
+      ctx.fillText(q.combo + '연속', q.x, q.y + 13);
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
 function fmtTime(s){
   const m = Math.floor(s / 60), r = s - m*60;
   return (m > 0 ? (m + ':' + (r < 10 ? '0' : '') + r.toFixed(1)) : r.toFixed(1) + '초');
 }
 // 주행 거리 (내부 유닛 → m / km)
-function fmtDist(u){
+//  fine=true 면 km 도 소수 세 자리 = 1m 단위로 보여 준다.
+//  2자리(10m 단위)로 끊으면 1km 를 넘는 순간 숫자가 10배 굵어져서,
+//  하필 제일 빨리 달릴 때 계기판이 "느려진" 것처럼 보인다.
+//  1m 단위로 두면 마지막 자리가 초속(m/s) 만큼 넘어가 속도가 그대로 눈에 보인다.
+function fmtDist(u, fine){
   const m = u * M_PER_UNIT;
-  return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+  if (m < 1000) return Math.round(m) + ' m';
+  return (m / 1000).toFixed(fine ? 3 : 2) + ' km';
 }
 
 function drawHUD(){
@@ -1292,9 +1376,9 @@ function drawHUD(){
 
   ctx.textAlign = 'left';
   ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '9px Menlo, monospace';
-  ctx.fillText('거리', 14, 15);
+  ctx.fillText('기록', 14, 15);
   ctx.fillStyle = '#ffffff'; ctx.font = 'bold 22px Menlo, monospace';
-  ctx.fillText(fmtDist(G.dist), 14, 34);
+  ctx.fillText(fmtDist(scoreOf(G), true), 14, 34);
 
   ctx.textAlign = 'right';
   ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '9px Menlo, monospace';
@@ -1321,7 +1405,35 @@ function drawHUD(){
   // 시간 + 아슬아슬 (보조 지표)
   ctx.textAlign = 'left';
   ctx.fillStyle = 'rgba(255,255,255,0.40)'; ctx.font = '10px Menlo, monospace';
-  ctx.fillText(fmtTime(sec()) + (G.nearMiss > 0 ? '   아슬아슬 ' + G.nearMiss : ''), 14, 66);
+  // 기록이 어디서 왔는지 항상 보이게 — 보너스가 안 보이면 규칙이 없는 거나 같다.
+  // 오른쪽 BEST 와 부딪히지 않게 이 줄은 짧게 유지하고, 아슬아슬은 아래 줄로 뺀다.
+  ctx.fillText(fmtTime(sec()) + '  ·  주행 ' + fmtDist(G.dist, true), 14, 66);
+
+  // 아슬아슬 줄 — 지금까지 번 보너스 / 속도 배율 / 콤보를 한 덩어리로
+  const sm = spdMul();
+  if (G.bonus > 0 || G.combo > 0 || sm > 1.05){
+    const cx = 14; let cy = 82;
+    ctx.font = 'bold 11px Menlo, monospace';
+    let bx2 = cx;
+    if (G.bonus > 0){
+      ctx.fillStyle = '#ffe9a8';
+      const t1 = '아슬 +' + fmtDist(G.bonus);
+      ctx.fillText(t1, bx2, cy); bx2 += ctx.measureText(t1).width + 10;
+    }
+    if (sm > 1.05){
+      ctx.fillStyle = sm > 1.9 ? '#ff9c7a' : 'rgba(255,210,87,0.9)';
+      const t2 = '속도 x' + sm.toFixed(1);
+      ctx.fillText(t2, bx2, cy); bx2 += ctx.measureText(t2).width + 10;
+    }
+    if (G.combo > 0){
+      ctx.fillStyle = '#ffd257';
+      ctx.fillText(G.combo + '연속 x' + comboMul().toFixed(1), bx2, cy);
+      // 콤보 게이지 — 남은 시간이 줄어드는 게 보여야 이어 갈 마음이 든다
+      const w = 120, pct = G.comboT / COMBO_HOLD;
+      ctx.fillStyle = 'rgba(255,210,87,0.18)'; ctx.fillRect(cx, cy + 8, w, 3);
+      ctx.fillStyle = 'rgba(255,210,87,0.9)';  ctx.fillRect(cx, cy + 8, w * pct, 3);
+    }
+  }
   // 최고 기록
   if (bestDist > 0){
     ctx.textAlign = 'right';
@@ -1388,7 +1500,7 @@ function drawTitle(){
   // ── 지난 주행 기록 (죽고 나면 여기로 돌아온다)
   let y = 156;
   if (lastRun){
-    const bw = 268, bx = LW/2 - bw/2, bh = 104;
+    const bw = 268, bx = LW/2 - bw/2, bh = 116;
     ctx.fillStyle = 'rgba(20,26,32,0.92)';
     rr(ctx, bx, y, bw, bh, 12); ctx.fill();
     ctx.strokeStyle = lastRun.newBest ? 'rgba(92,255,158,0.55)' : 'rgba(255,255,255,0.12)';
@@ -1400,15 +1512,20 @@ function drawTitle(){
     ctx.fillText((lastRun.newBest ? '★ 최고 기록 ★' : '지난 기록') + rk, LW/2, y + 17);
 
     ctx.font = 'bold 30px Menlo, monospace'; ctx.fillStyle = '#ffffff';
-    ctx.fillText(fmtDist(lastRun.dist || 0), LW/2, y + 46);
+    ctx.fillText(fmtDist(lastRun.score != null ? lastRun.score : (lastRun.dist || 0)), LW/2, y + 46);
 
     ctx.font = '11px Menlo, monospace';
+    const nb = lastRun.nearMiss + ' 회'
+             + (lastRun.comboBest > 1 ? ' (' + lastRun.comboBest + '연속)' : '')
+             + (lastRun.bonus > 0 ? '  +' + fmtDist(lastRun.bonus) : '');
     ctx.textAlign = 'left';
-    ctx.fillStyle = 'rgba(255,255,255,0.58)'; ctx.fillText('추월', bx + 22, y + 74);
-    ctx.fillStyle = 'rgba(255,255,255,0.58)'; ctx.fillText('아슬아슬', bx + 22, y + 90);
+    ctx.fillStyle = 'rgba(255,255,255,0.58)'; ctx.fillText('주행', bx + 22, y + 70);
+    ctx.fillStyle = 'rgba(255,255,255,0.58)'; ctx.fillText('추월', bx + 22, y + 86);
+    ctx.fillStyle = 'rgba(255,255,255,0.58)'; ctx.fillText('아슬아슬', bx + 22, y + 102);
     ctx.textAlign = 'right';
-    ctx.fillStyle = '#5cff9e'; ctx.fillText(lastRun.overtakes + ' 대', bx + bw - 22, y + 74);
-    ctx.fillStyle = '#ffe9a8'; ctx.fillText(lastRun.nearMiss + ' 회', bx + bw - 22, y + 90);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.fillText(fmtDist(lastRun.dist || 0), bx + bw - 22, y + 70);
+    ctx.fillStyle = '#5cff9e'; ctx.fillText(lastRun.overtakes + ' 대', bx + bw - 22, y + 86);
+    ctx.fillStyle = '#ffe9a8'; ctx.fillText(nb, bx + bw - 22, y + 102);
     ctx.textAlign = 'center';
     y += bh + 18;
   } else y = 190;
@@ -1427,7 +1544,7 @@ function drawTitle(){
   btn(LW/2 - 108, y, 216, 40, 'rank', '랭킹', false, '세 게임 전체 순위');
   y += 46;
   btn(LW/2 - 108, y, 216, 34, 'mine', '내 기록', false,
-      ranks.length ? ('최고 ' + fmtDist(ranks[0].dist || 0)) : '기록 없음');
+      ranks.length ? ('최고 ' + fmtDist(ranks[0].score != null ? ranks[0].score : (ranks[0].dist||0))) : '기록 없음');
   y += 42;
   y += 6;
 
@@ -1436,10 +1553,12 @@ function drawTitle(){
   ctx.fillStyle = 'rgba(255,255,255,0.62)'; ctx.font = '11px Menlo, monospace';
   const lines = [
     '← →  또는  A D   좌우     ·     ↑ 또는 W   가속',
-    '브레이크는 없습니다. 핸들로만 피하세요',
-    '모바일은 우측 하단 ▲ 버튼으로 가속',
+    '차 사이를 스칠수록 (아슬아슬) 기록이 더 붙습니다',
+    '빠를수록 · 연속으로 스칠수록 보너스가 커집니다',
   ];
-  lines.forEach((l, i) => ctx.fillText(l, LW/2, y + i*18));
+  // 위에서 쌓아 내려오면 결과 박스 높이에 따라 버튼과 겹친다. 아래에서 잡는다.
+  const ly = Math.max(y + 6, LH - 52 - (lines.length - 1) * 18);
+  lines.forEach((l, i) => ctx.fillText(l, LW/2, ly + i*18));
 
   ctx.fillStyle = 'rgba(255,255,255,0.22)'; ctx.font = '10px Menlo, monospace';
   ctx.fillText('M 음소거', LW/2, LH - 22);
@@ -1489,12 +1608,13 @@ function drawRank(){
     ctx.fillStyle = mine ? '#5cff9e' : 'rgba(255,255,255,0.78)';
     ctx.fillText((r.name || '나').slice(0, 8), 62, cy - 6);
     ctx.fillStyle = 'rgba(255,255,255,0.32)'; ctx.font = '9px Menlo, monospace';
-    ctx.fillText('추월 ' + (r.overtakes || 0) + '  ·  ' + fmtTime(r.sec || 0) + '  ·  ' + fmtDate(r.ts || Date.now()), 62, cy + 8);
-    // 거리
+    ctx.fillText('추월 ' + (r.overtakes || 0) + '  ·  아슬 ' + (r.nearMiss || 0)
+               + '  ·  ' + fmtTime(r.sec || 0) + '  ·  ' + fmtDate(r.ts || Date.now()), 62, cy + 8);
+    // 기록 (주행 + 아슬아슬 보너스). 예전 기록엔 score 가 없어 dist 로 떨어진다.
     ctx.textAlign = 'right';
     ctx.font = 'bold 17px Menlo, monospace';
     ctx.fillStyle = mine ? '#5cff9e' : '#ffffff';
-    ctx.fillText(fmtDist(r.dist || 0), LW - 34, cy);
+    ctx.fillText(fmtDist(r.score != null ? r.score : (r.dist || 0)), LW - 34, cy);
   }
   ctx.restore();
 
@@ -1556,6 +1676,7 @@ function render(){
     drawCars();
     if (!G.finished) drawPlayer();
     drawParts();
+    drawPops();
     if (window.__race && window.__race._hit) drawHitboxes();
   }
   ctx.restore();
@@ -1676,6 +1797,23 @@ window.__race = {
   get sec(){ return G ? sec() : 0; },
   get fps(){ return fpsSamples.length ? fpsSamples.reduce((a,b)=>a+b,0)/fpsSamples.length : 0; },
   get diff(){ return G ? diff() : null; },
+  // 아슬아슬 보너스 검증용
+  get score(){ return G ? scoreOf(G) : 0; },
+  get bonus(){ return G ? G.bonus : 0; },
+  get combo(){ return G ? G.combo : 0; },
+  get nearMiss(){ return G ? G.nearMiss : 0; },
+  get spdMul(){ return G ? spdMul() : 1; },
+  get comboMul(){ return G ? comboMul() : 1; },
+  get nearConsts(){ return { NEAR_BASE, NEAR_SPD_SCALE, NEAR_COMBO_MAX, NEAR_COMBO_STEP, COMBO_HOLD, M_PER_UNIT }; },
+  // 아슬아슬을 인위적으로 한 번 발생시킨다 (보너스 계산 검증용)
+  forceNear(){ if (!G) return null; const before = G.bonus;
+    G.combo = (G.comboT > 0) ? G.combo + 1 : 1; G.comboT = COMBO_HOLD;
+    if (G.combo > G.comboBest) G.comboBest = G.combo;
+    const gain = NEAR_BASE * spdMul() * comboMul();
+    G.bonus += gain; G.nearMiss++;
+    return { gain, gainM: gain * M_PER_UNIT, combo: G.combo, spdMul: spdMul(), comboMul: comboMul(), before }; },
+  setSpd(v){ player.spd = Math.max(SPD_BASE, Math.min(SPD_MAX, v)); },
+  fmt(u, fine){ return fmtDist(u, fine); },
   get best(){ return bestDist; },
   get lastRun(){ return lastRun; },
   get gas(){ return { on: Input.gas || Input.up, box: GAS }; },
