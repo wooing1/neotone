@@ -885,7 +885,7 @@ function homingTarget(x, y){
   if (Net.isOnline() && !Net.isHost()){
     let best = null, bd = 1e9;
     if (G && G.mode === 'BOSS' && NetWorld.boss.alive) return { x: NetWorld.boss.x, y: NetWorld.boss.y };
-    for (let i=0;i<NetWorld.enemies.length;i++){
+    for (let i=0;i<NetWorld.ne;i++){
       const e = NetWorld.enemies[i];
       const d = (e.x-x)*(e.x-x) + (e.y-y)*(e.y-y);
       if (d < bd){ bd = d; best = e; }
@@ -1623,6 +1623,9 @@ function addPower(n){
 }
 
 function newRun(){
+  // 새 런에서는 지난 스냅샷의 잔상이 남지 않게 개수를 0 으로 (풀 자체는 재사용)
+  NetWorld.nb = 0; NetWorld.ne = 0; NetWorld.ni = 0;
+  NetWorld._bossWas = true; clientGrazeNear = 0;
   clearBullets(false);
   clearEnemies();
   for (const s of pshots) s.on = false;
@@ -2477,7 +2480,7 @@ function updatePShots(){
     if (visualOnly){
       // 게스트: 데미지는 없지만 같은 자리에서 사라지고 같은 불꽃을 낸다
       const es = NetWorld.enemies;
-      for (let k=0;k<es.length;k++){
+      for (let k=0;k<NetWorld.ne;k++){
         const e = es[k];
         const r = ETYPE_R[e.type] || 15;
         const dx = s.x-e.x, dy = s.y-e.y;
@@ -2760,7 +2763,10 @@ function encodeSnapshot(){
 // 클라이언트가 그릴 월드
 const NetWorld = {
   segName: '',
+  // 배열을 스냅샷마다 새로 채우면 초당 1.7만 개(560개 × 30Hz)의 객체가 생겨 GC 를 압박한다.
+  // 그래서 배열은 줄이지 않고(풀) 개수만 따로 센다. 순회는 반드시 nb/ne/ni 까지만 돈다.
   bullets: [], enemies: [], items: [],
+  nb: 0, ne: 0, ni: 0,
   _prevE: [], _bossWas: true,          // 격추 감지용 (직전 스냅샷의 적 / 보스 생존)
   boss: { x: LW/2, y: PF.y+120, alive: true },
   phaseHP: 1, phaseHPMax: 1, mode: 'STAGE', phase: 0, frame: 0,
@@ -2793,38 +2799,44 @@ function decodeSnapshot(buf){
   }
 
   const nb = v.getUint16(o); o += 2;
-  NetWorld.bullets.length = 0;
+  const bArr = NetWorld.bullets;
   for (let i=0;i<nb;i++){
     const x = v.getInt16(o); o += 2;
     const y = v.getInt16(o); o += 2;
     const k = ID_KIND[v.getUint8(o)] || 'ring'; o += 1;
     const rot = v.getUint8(o) / 255 * TAU; o += 1;
-    NetWorld.bullets.push({ x, y, kind:k, rot });
+    let b = bArr[i];
+    if (b === undefined) b = bArr[i] = { x:0, y:0, kind:'ring', rot:0 };
+    b.x = x; b.y = y; b.kind = k; b.rot = rot;
   }
+  NetWorld.nb = nb;
   const ne = v.getUint8(o); o += 1;
   // 폭발 이펙트는 스냅샷에 없다 (호스트 로컬). 그래서 게스트 화면은 늘 밋밋했다.
   // 직전 스냅샷에 있던 적이 사라졌으면 격추로 보고 같은 자리에서 터뜨린다.
   const prevE = NetWorld._prevE;
-  prevE.length = 0;
-  for (let i=0;i<NetWorld.enemies.length;i++){
+  let np2 = 0;
+  for (let i=0;i<NetWorld.ne;i++){
     const e = NetWorld.enemies[i];
-    prevE.push(e.x, e.y, e.type);
+    prevE[np2] = e.x; prevE[np2+1] = e.y; prevE[np2+2] = e.type; np2 += 3;
   }
-  NetWorld.enemies.length = 0;
+  const eArr = NetWorld.enemies;
   for (let i=0;i<ne;i++){
     const x = v.getInt16(o); o += 2;
     const y = v.getInt16(o); o += 2;
     const t = ID_ETYPE[v.getUint8(o)] || 'straight'; o += 1;
     const hp = v.getUint8(o) / 255; o += 1;
-    NetWorld.enemies.push({ x, y, type:t, hpPct:hp });
+    let e = eArr[i];
+    if (e === undefined) e = eArr[i] = { x:0, y:0, type:'straight', hpPct:1 };
+    e.x = x; e.y = y; e.type = t; e.hpPct = hp;
   }
-  for (let i=0;i<prevE.length;i+=3){
+  NetWorld.ne = ne;
+  for (let i=0;i<np2;i+=3){
     const px = prevE[i], py = prevE[i+1], pt = prevE[i+2];
     // 화면 밖으로 빠져나간 적은 격추가 아니다
     if (py < PF.y - 10 || py > PF.y + PF.h - 50) continue;
     if (px < PF.x - 10 || px > PF.x + PF.w + 10) continue;
     let alive = false;
-    for (let k=0;k<NetWorld.enemies.length;k++){
+    for (let k=0;k<NetWorld.ne;k++){
       const e = NetWorld.enemies[k];
       if (e.type !== pt) continue;
       const dx = e.x - px, dy = e.y - py;
@@ -2836,14 +2848,17 @@ function decodeSnapshot(buf){
     explode(NetWorld.boss.x, NetWorld.boss.y, 4.2, '#ffe6a0', '#7a5560');
   NetWorld._bossWas = NetWorld.boss.alive;
   const ni = v.getUint8(o); o += 1;
-  NetWorld.items.length = 0;
+  const iArr = NetWorld.items;
   for (let i=0;i<ni;i++){
     const id = v.getUint16(o); o += 2;
     const x = v.getInt16(o); o += 2;
     const y = v.getInt16(o); o += 2;
     const k = ID_IKIND[v.getUint8(o)] || 'score'; o += 1;
-    NetWorld.items.push({ id, x, y, kind:k });
+    let it = iArr[i];
+    if (it === undefined) it = iArr[i] = { id:0, x:0, y:0, kind:'score' };
+    it.id = id; it.x = x; it.y = y; it.kind = k;
   }
+  NetWorld.ni = ni;
 }
 
 // 클라이언트 → 호스트 : 자기 슬롯 상태
@@ -3038,7 +3053,7 @@ function clientCollide(){
   const gr = player.grazeR + 6, gr2 = gr*gr;
   const hr = player.hitR + 4.3, hr2 = hr*hr;
   let near = 0;
-  for (let i=0;i<bs.length;i++){
+  for (let i=0;i<NetWorld.nb;i++){
     const b = bs[i];
     const dx = b.x - player.x, dy = b.y - player.y;
     const d2 = dx*dx + dy*dy;
@@ -3061,7 +3076,7 @@ function clientPickup(){
   if (G.spectating) return;
   if (clientPicked.size > 200) clientPicked.clear();
   const its = NetWorld.items;
-  for (let i=0;i<its.length;i++){
+  for (let i=0;i<NetWorld.ni;i++){
     const it = its[i];
     const ex = clientPicked.get(it.id);
     if (ex !== undefined){ if (frame < ex) continue; clientPicked.delete(it.id); }
@@ -3465,9 +3480,8 @@ function drawNetWorld(){
 }
 
 function drawNetItems(){
-  for (let i=0;i<NetWorld.items.length;i++){
+  for (let i=0;i<NetWorld.ni;i++){
     const it = NetWorld.items[i];
-    if (it._got) continue;
     const spr = (it.kind === 'power') ? SPR.power
               : (it.kind === 'score') ? SPR.item : SPR[it.kind];
     drawSprite(spr || SPR.item, it.x, it.y, 0, 1, 1);
@@ -3475,7 +3489,7 @@ function drawNetItems(){
 }
 
 function drawNetEnemies(){
-  for (let i=0;i<NetWorld.enemies.length;i++){
+  for (let i=0;i<NetWorld.ne;i++){
     const e = NetWorld.enemies[i];
     if (e.type === 'midboss'){
       ctx.save(); ctx.translate(e.x, e.y);
@@ -3498,7 +3512,7 @@ function drawNetBullets(){
   ctx.save();
   ctx.beginPath(); ctx.rect(PF.x-30, PF.y-30, PF.w+60, PF.h+60); ctx.clip();
   const sx = shakeX * drawScale, sy = shakeY * drawScale;
-  for (let i=0;i<NetWorld.bullets.length;i++){
+  for (let i=0;i<NetWorld.nb;i++){
     const b = NetWorld.bullets[i];
     const spr = SPR[b.kind];
     if (!spr) continue;
@@ -4573,7 +4587,7 @@ window.__game = {
     let best = null, bestY = -1e9;
     // 온라인 클라이언트는 월드가 로컬에 없다 — 호스트가 보내준 NetWorld를 본다
     if (Net.isOnline() && !Net.isHost()){
-      for (let i=0;i<NetWorld.enemies.length;i++){
+      for (let i=0;i<NetWorld.ne;i++){
         const e = NetWorld.enemies[i];
         if (e.y > bestY){ bestY = e.y; best = e; }
       }
@@ -4588,7 +4602,7 @@ window.__game = {
   nearestPower(){              // 자동 테스트용: 가장 가까운 파워 아이템
     let best = null, bd = 1e9;
     if (Net.isOnline() && !Net.isHost()){
-      for (let i=0;i<NetWorld.items.length;i++){
+      for (let i=0;i<NetWorld.ni;i++){
         const it = NetWorld.items[i];
         if (it.kind !== 'power') continue;
         const d = Math.hypot(it.x-player.x, it.y-player.y);
@@ -4618,8 +4632,8 @@ window.__game = {
                                 x: Math.round(p.x), y: Math.round(p.y),
                                 lives: p.lives, power: +p.power.toFixed(2),
                                 spectating: p.spectating })),
-                      world: { bullets: NetWorld.bullets.length, enemies: NetWorld.enemies.length,
-                               items: NetWorld.items.length, mode: NetWorld.mode, phase: NetWorld.phase } }; },
+                      world: { bullets: NetWorld.nb, enemies: NetWorld.ne,
+                               items: NetWorld.ni, mode: NetWorld.mode, phase: NetWorld.phase } }; },
   uiTap(id){ for (const b of uiBtns) if (b.id === id){ Input.uiTap = { x: b.x + b.w/2, y: b.y + b.h/2 }; return true; } return false; },
   get screen(){ return state + (state === S.LOBBY ? ':' + lobbyRole : ''); },
   setBloom(v){ BLOOM_STRENGTH = v; },
