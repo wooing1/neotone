@@ -21,6 +21,16 @@
 <div id="wrap"><canvas id="cv"></canvas></div>
 <input id="nick" maxlength="8" autocomplete="off" spellcheck="false" placeholder="이름 (8자)">
 <script>
+/* 이 스크립트 전체를 IIFE 로 감싸 둔다.
+   감싸지 않으면 최상위 function / var / const / let 이 전부 전역이 되어
+   콘솔에서 G, Rank, crash, scoreOf 같은 이름에 그대로 닿고 재대입도 된다
+   (const 는 window 프로퍼티가 아니라 안 새는 것처럼 보이지만,
+    스크립트 전역 어휘 범위에 올라가 이름만으로 불린다).
+   밖으로 내보내는 것은 window.__race 와 window.__input 둘뿐이다 —
+   같은 파일의 arcade-rankui / arcade-bar 블록은 그 둘과 window.ArcadeRankUI 만 본다.
+   (인라인 on... 핸들러는 이 페이지에 하나도 없다 — 있었으면 전역 함수를 찾지 못해 깨졌다)
+   오염 표식(tainted) 이 사는 클로저도 바로 이것이다. */
+(function(){
 'use strict';
 /* ═══════════════════════════════════════════════════════════════
    쌩쌩 추월 (OVERTAKE)
@@ -439,6 +449,30 @@ function uiHit(pt){
 const HAS_HOME = (function(){ try { return location.protocol !== 'file:'; } catch(e){ return false; } })();
 function goHome(){ try { location.href = '/'; } catch(e){} }
 
+/* ── 디버그 훅 오염 표식 ────────────────────────────────────
+   __race 훅으로 판 상태를 건드리거나 살아 있는 내부 객체를 꺼내 가면
+   그 판을 '오염' 으로 표시하고 서버 공용 랭킹에는 올리지 않는다.
+   로컬 기록(localStorage)은 그대로 남긴다 — 혼자 보는 값이라 남을 속이지 않는다.
+
+   왜 필요한가: 서버의 시간 검사는 "훅으로 무적을 켜고 60초 기다린 뒤
+   시간 예산만큼의 점수를 넣고 정상적으로 죽는" 스크립트를 못 막는다.
+   서버가 볼 수 있는 건 경과 시간과 최종 점수뿐이고 둘 다 앞뒤가 맞기 때문이다.
+   그래서 "이 판은 손을 댔다" 는 사실을 아는 유일한 곳 — 게임 안 — 에서 기록한다.
+
+   표식은 이 스크립트를 감싼 IIFE 클로저 안에만 산다.
+   window 에도 __race 에도 노출하지 않는다. 읽기용 게터조차 두지 않는다 —
+   보이면 언제 되돌려야 하는지 알 수 있고, setter 를 두면 그 순간 전부 무의미해진다.
+   지우는 길은 하나뿐: 디버그 상태가 하나도 안 남은 채로 newRun() 이 다시 도는 것.
+   = 타이틀에서 '시작' 을 누르는 정상 경로. 디버그 start() 훅은 newRun() 다음에
+   다시 표식을 세우므로 그 경로로는 절대 지워지지 않는다. */
+let tainted = false;
+// 무적 / x 고정 / 히트박스 표시도 클로저 안에 둔다.
+// 예전에는 window.__race._inv 를 읽었는데, 그러면 훅(invincible())을 거치지 않고
+// 콘솔에서 __race._inv = 1 만 해도 무적이 켜지고 오염 표식은 안 붙는다.
+let dbgInv = false, dbgPin = null, dbgHit = false;
+// 훅이 하나라도 불리면 여기를 지난다. 되돌리는 함수는 일부러 만들지 않았다.
+const taint = () => { tainted = true; };
+
 /* ── 공용 랭킹 (서버) ──────────────────────────────────────
    세 게임이 같은 출처라서 nginx 를 건드릴 필요가 없다.
    /plane/ 프록시의 끝 슬래시가 접두사를 잘라내므로
@@ -446,31 +480,59 @@ function goHome(){ try { location.href = '/'; } catch(e){} }
    실패해도 게임은 그대로 돌아야 한다 — 전부 삼킨다. */
 const Rank = (function(){
   const API = '/plane/api/rank';
-  let uid = '';
-  try {
-    uid = localStorage.getItem('arcade-uid') || '';
-    if (!uid){
-      uid = Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-      localStorage.setItem('arcade-uid', uid);
-    }
-  } catch(e){ uid = 'anon'; }
-  function who(){
-    try { return localStorage.getItem('arcade-name') || localStorage.getItem('overtake-name') || ''; }
-    catch(e){ return ''; }
+  function ls(k, v){
+    try {
+      if (v === undefined) return localStorage.getItem(k) || '';
+      localStorage.setItem(k, v);
+    } catch(e){}
+    return '';
+  }
+  function who(){ return ls('arcade-name') || ls('overtake-name') || ''; }
+  // 런 토큰은 클로저 변수로만 들고 있는다. localStorage 에 두면 새로고침·다른 탭에서
+  // 같은 표를 다시 쓰게 되는데, 서버는 1회용으로 보고 'token used' 로 거절한다.
+  let tok = '';
+  // 보낼 곳이 없는 상황(오프라인 file:// 플레이, fetch 가 없는 옛 브라우저)을 한 곳에서 판단한다.
+  // 그냥 두면 콘솔이 CORS/에러로 가득 찬다.
+  function off(){
+    try { return location.protocol === 'file:' || typeof fetch !== 'function'; }
+    catch(e){ return true; }
+  }
+  // 어떤 실패도 게임 코드로 새면 안 된다 — 거부(reject)가 아니라 항상 null 로 끝난다.
+  function post(url, body){
+    try {
+      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify(body) })
+        .then(function(r){ return r.json(); })
+        .catch(function(){ return null; });
+    } catch(e){ return Promise.resolve(null); }
   }
   return {
-    uid: uid,
+    get uid(){ return ls('arcade-uid'); },
     get name(){ return who(); },
+    // 판이 진짜로 시작하는 순간에 부른다. 서버가 경과 시간을 이 토큰의 발급 시각으로 직접 재므로,
+    // 타이틀 화면에서 미리 받아 두면 시간만 부풀어 위조 여유를 준다.
+    start(game){
+      tok = '';                                  // 지난 판의 표가 남아 있으면 여기서 버린다
+      if (off()) return Promise.resolve(null);
+      const body = { game: game };
+      const uid = ls('arcade-uid');
+      if (uid) body.uid = uid;                   // 없으면 키째로 빼서 서버가 새로 발급하게 한다
+      return post(API + '/start', body).then(function(d){
+        if (!d || !d.ok) return null;            // 429(IP 한도) 포함 — 조용히 이번 판 제출을 포기한다
+        // 서명 없는 옛 uid 는 서버가 무시하고 새로 발급한다. 그냥 덮어쓰면 된다.
+        if (d.uid) ls('arcade-uid', d.uid);
+        tok = d.tok || '';
+        return d;
+      }).catch(function(){ return null; });
+    },
     submit(game, score, meta){
-      try {
-        // file:// 로 직접 열었을 때는 보낼 곳이 없다 (README 가 안내하는 오프라인 플레이).
-        // 그냥 두면 콘솔이 CORS 에러로 가득 찬다.
-        if (location.protocol === 'file:') return Promise.resolve(null);
-        return fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ game: game, score: Math.round(score), name: who(),
-                                 uid: uid, meta: meta || {} }) })
-          .then(r => r.json()).catch(function(){ return null; });
-      } catch(e){ return Promise.resolve(null); }
+      if (off()) return Promise.resolve(null);
+      const t = tok;
+      tok = '';                                  // 먼저 비운다 — 같은 표로 두 번 제출되는 경로를 없앤다
+      if (!t) return Promise.resolve(null);      // 시작 때 표를 못 받았으면 낼 근거가 없다
+      // uid 는 보내지 않는다 (v2). 서버가 토큰에서 꺼내 쓴다.
+      return post(API, { game: game, tok: t, score: Math.round(score),
+                         name: who(), meta: meta || {} });
     },
   };
 })();
@@ -585,6 +647,10 @@ let frame = 0, scroll = 0, shake = 0, flash = 0;
 let overTick = 0;            // 충돌 화면이 시작 화면으로 넘어가기까지 남은 프레임
 
 function newRun(){
+  // 새 판이 시작될 때만 오염 표식을 지운다. 단, 무적 같은 디버그 상태가 아직 켜져 있으면
+  // 지우지 않는다 — 안 그러면 '무적 켜 놓고 정상 경로로 시작' 이 깨끗한 판이 돼 버린다.
+  // 디버그 start() 훅은 이 함수를 부른 뒤 다시 taint() 하므로 여기서 지워지지 않는다.
+  tainted = (dbgInv || dbgPin != null || dbgHit);
   for (let i=0;i<MAX_CAR;i++) cars[i].on = false;
   for (let i=0;i<MAX_PART;i++) parts[i].on = false;
   for (let i=0;i<MAX_PROP;i++) props[i].on = false;
@@ -877,7 +943,7 @@ function updatePlayer(){
   player.x += player.vx;
 
   // 자동 테스트용 — 특정 x 에 고정 (안전지대 검사)
-  if (window.__race && window.__race._pin != null){ player.x = window.__race._pin; player.vx = 0; }
+  if (dbgPin != null){ player.x = dbgPin; player.vx = 0; }
 
   // 가드레일 — 즉사가 아니라 튕기고 감속. 즉사로 하면 너무 짜다.
   const half = PLAYER.w / 2;
@@ -1072,7 +1138,7 @@ function hitRR(dx, dy, aw, ah, ar, bw, bh, br){
 const carR = c => (c.kind === 'truck' ? TRUCK_R : CAR_R);
 
 function collide(){
-  if (window.__race && window.__race._inv) return;   // 자동 테스트용 무적
+  if (dbgInv) return;                                // 자동 테스트용 무적 (클로저 변수 — 콘솔에서 직접 못 켠다)
   const px = player.x, py = player.y;
   for (let i=0;i<MAX_CAR;i++){
     const c = cars[i];
@@ -1118,7 +1184,8 @@ function crash(c){
                         combo: G.comboBest, name: nick, ts: Date.now() });
   // 서버 공용 랭킹에도 올린다. 단위는 내부 유닛이 아니라 미터여야 다른 게임과 축이 맞는다.
   // 한 판에 한 번만 (crash 가 두 번 불리는 경로를 대비).
-  if (!G._sent){
+  // 디버그 훅이 닿은 판은 서버로 보내지 않는다. 위의 로컬 기록/BEST 는 그대로 쓴다.
+  if (!G._sent && !tainted){
     G._sent = 1;
     Rank.submit('race', sc * M_PER_UNIT, { sec: +t.toFixed(1), overtakes: G.overtakes,
                                            nearMiss: G.nearMiss, combo: G.comboBest });
@@ -1677,7 +1744,7 @@ function render(){
     if (!G.finished) drawPlayer();
     drawParts();
     drawPops();
-    if (window.__race && window.__race._hit) drawHitboxes();
+    if (dbgHit) drawHitboxes();
   }
   ctx.restore();
 
@@ -1721,6 +1788,10 @@ function handleInput(){
       Sound.init(); Sound.resume(); Sound.ui();
       myRankIdx = -1;
       newRun(); state = S.PLAY;
+      // 런 토큰은 판이 진짜로 시작하는 이 순간에 받는다 (타이틀 화면이 아니라).
+      // 서버가 경과 시간을 토큰 발급 시각부터 재기 때문에, 미리 받아 두면 시간이 부풀어
+      // 위조 여유가 생긴다. 실패해도 조용히 넘어가고 게임은 그대로 돈다.
+      Rank.start('race');
     } else if (id === 'rank'){
       Sound.ui(); if (window.ArcadeRankUI) window.ArcadeRankUI.open();
     } else if (id === 'mine'){
@@ -1788,15 +1859,22 @@ requestAnimationFrame(loop);
    자동 테스트용 훅
    ═══════════════════════════════════════════════════ */
 window.__input = Input;          // 자동 테스트가 키 입력을 흉내내는 통로
+/* 훅은 지우지 않는다 — 자동 테스트가 전부 이 통로로 게임을 몬다.
+   대신 "상태를 바꾸거나 살아 있는 내부 객체를 넘겨주는" 훅은 전부 taint() 를 지난다.
+   반대로 숫자 하나만 돌려주는 읽기 전용 게터는 표식을 세우지 않는다 —
+   특히 state 는 공용 상단 바(arcade-bar)가 0.35초마다 읽으므로 여기 넣으면
+   아무것도 안 해도 모든 판이 오염된다.
+   consts / gas 처럼 원래 내부 객체를 그대로 넘기던 것은 복사본으로 바꿨다.
+   훅을 안 거치고 __race.consts.PLAYER.w = 0 로 판정을 없앨 수 있었기 때문이다. */
 window.__race = {
-  get state(){ return state; },
-  get G(){ return G; },
-  get player(){ return player; },
-  get cars(){ return cars; },
-  get liveCars(){ return liveCars(); },
+  get state(){ return state; },                       // 상단 바가 폴링한다 — 표식 없음
+  get G(){ taint(); return G; },
+  get player(){ taint(); return player; },
+  get cars(){ taint(); return cars; },
+  get liveCars(){ taint(); return liveCars(); },
   get sec(){ return G ? sec() : 0; },
   get fps(){ return fpsSamples.length ? fpsSamples.reduce((a,b)=>a+b,0)/fpsSamples.length : 0; },
-  get diff(){ return G ? diff() : null; },
+  get diff(){ taint(); return G ? diff() : null; },   // 난이도 객체는 살아 있는 참조다
   // 아슬아슬 보너스 검증용
   get score(){ return G ? scoreOf(G) : 0; },
   get bonus(){ return G ? G.bonus : 0; },
@@ -1806,18 +1884,19 @@ window.__race = {
   get comboMul(){ return G ? comboMul() : 1; },
   get nearConsts(){ return { NEAR_BASE, NEAR_SPD_SCALE, NEAR_COMBO_MAX, NEAR_COMBO_STEP, COMBO_HOLD, M_PER_UNIT }; },
   // 아슬아슬을 인위적으로 한 번 발생시킨다 (보너스 계산 검증용)
-  forceNear(){ if (!G) return null; const before = G.bonus;
+  forceNear(){ if (!G) return null; taint(); const before = G.bonus;
     G.combo = (G.comboT > 0) ? G.combo + 1 : 1; G.comboT = COMBO_HOLD;
     if (G.combo > G.comboBest) G.comboBest = G.combo;
     const gain = NEAR_BASE * spdMul() * comboMul();
     G.bonus += gain; G.nearMiss++;
     return { gain, gainM: gain * M_PER_UNIT, combo: G.combo, spdMul: spdMul(), comboMul: comboMul(), before }; },
-  setSpd(v){ player.spd = Math.max(SPD_BASE, Math.min(SPD_MAX, v)); },
+  setSpd(v){ taint(); player.spd = Math.max(SPD_BASE, Math.min(SPD_MAX, v)); },
   fmt(u, fine){ return fmtDist(u, fine); },
   get best(){ return bestDist; },
   get lastRun(){ return lastRun; },
-  get gas(){ return { on: Input.gas || Input.up, box: GAS }; },
-  // 겹친 차량 쌍 수 — 관통 검증용. 0 이어야 한다.
+  // GAS 는 내부 객체다 — 복사본을 준다 (버튼 판정 영역을 콘솔에서 못 늘리게)
+  get gas(){ return { on: Input.gas || Input.up, box: Object.assign({}, GAS) }; },
+  // 겹친 차량 쌍 수 — 관통 검증용. 0 이어야 한다. (숫자 스냅샷이라 표식 없음)
   get overlaps(){
     const out = [];
     for (let i=0;i<MAX_CAR;i++){
@@ -1834,12 +1913,14 @@ window.__race = {
     for (let i=0;i<MAX_CAR;i++){ const c = cars[i]; if (!c.on) continue;
       o[c.kind]++; if (c.changing || c.pendingLane >= 0) o.changing++; }
     return o; },
-  start(){ Sound.init(); newRun(); state = 'PLAY'; },
-  setTime(s){ if (G) G.time = Math.round(s * 60); },
-  invincible(v){ this._inv = v; },
-  pin(x){ this._pin = x; },                 // 플레이어를 x 에 고정 (안전지대 검사용)
-  showHit(v){ this._hit = v; },             // 히트박스 외곽선 표시
-  collideOnce(){ collide(); },              // 판정 경계 측정용
+  // 자동 테스트도 같은 시작 경로를 타야 제출 경로가 검증된다.
+  // newRun() 이 표식을 지우므로 그 "뒤에" 다시 세운다 — 훅으로 시작한 판은 늘 오염이다.
+  start(){ Sound.init(); newRun(); state = 'PLAY'; Rank.start('race'); taint(); },
+  setTime(s){ taint(); if (G) G.time = Math.round(s * 60); },
+  invincible(v){ taint(); dbgInv = !!v; },
+  pin(x){ taint(); dbgPin = x; },           // 플레이어를 x 에 고정 (안전지대 검사용)
+  showHit(v){ taint(); dbgHit = !!v; },     // 히트박스 외곽선 표시
+  collideOnce(){ taint(); collide(); },     // 판정 경계 측정용
   get hitRR(){ return hitRR; },
   // 스프라이트 실제 크기 vs 판정 크기 — 싱크 검증용
   hitInfo(){
@@ -1852,8 +1933,8 @@ window.__race = {
   laneEdges(){ const o = []; for (let i=1;i<LANES;i++) o.push(ROAD.x + LANE_W * i); return o; },
   get carOffsets(){ const o = []; for (let i=0;i<MAX_CAR;i++){ const c = cars[i];
     if (c.on) o.push(Math.round(c.x - laneX(c.lane))); } return o; },
-  kill(){ if (G && state === 'PLAY') crash(cars[0]); },
-  // 회피 AI 가 쓸 정보: 앞쪽 위험 지도
+  kill(){ taint(); if (G && state === 'PLAY') crash(cars[0]); },
+  // 회피 AI 가 쓸 정보: 앞쪽 위험 지도 (숫자 스냅샷)
   threats(){
     const out = [];
     for (let i=0;i<MAX_CAR;i++){
@@ -1867,18 +1948,25 @@ window.__race = {
     return out;
   },
   // 랭킹 / 이름 (자동 테스트용)
-  get ranks(){ return ranks; },
+  get ranks(){ taint(); return ranks; },              // 살아 있는 배열이다
   get myRank(){ return myRankIdx; },
   get nick(){ return nick; },
   get nickOpen(){ return nickOpen; },
   get buttons(){ return uiBtns.map(b => ({ id: b.id, x: Math.round(b.x + b.w/2), y: Math.round(b.y + b.h/2) })); },
-  tap(id){ const b = uiBtns.find(b => b.id === id); if (!b) return false;
+  tap(id){ taint(); const b = uiBtns.find(b => b.id === id); if (!b) return false;
            Input.tapPos = { x: b.x + b.w/2, y: b.y + b.h/2 }; Input.tapAnywhere = true; return true; },
-  go(s){ state = s; },
-  clearRanks(){ try { localStorage.removeItem('overtake-ranks-v2'); } catch(e){} ranks = []; myRankIdx = -1; },
-  consts: { LW, LH, ROAD, LANES, LANE_W, SPD_BASE, SPD_MAX, PLAYER,
-            T_LANECHANGE, T_WALL, T_ONCOMING },
+  go(s){ taint(); state = s; },
+  clearRanks(){ taint(); try { localStorage.removeItem('overtake-ranks-v2'); } catch(e){} ranks = []; myRankIdx = -1; },
+  // 값만 담은 새 객체. ROAD / PLAYER 는 얕은 복사로 끊어 준다.
+  get consts(){ return { LW, LH, ROAD: Object.assign({}, ROAD),
+            LANES, LANE_W, SPD_BASE, SPD_MAX, PLAYER: Object.assign({}, PLAYER),
+            T_LANECHANGE, T_WALL, T_ONCOMING }; },
 };
+// 훅 묶음 자체를 얼려서 delete / 재정의로 게터를 걷어내지 못하게 한다.
+// (게터를 갈아치워도 표식은 클로저에 있어 안 지워지지만, 굳이 길을 열어 둘 이유가 없다)
+Object.freeze(window.__race);
+try { Object.defineProperty(window, '__race', { value: window.__race, writable: false, configurable: false }); } catch(e){}
+})();
 </script>
 <style>
 /* arcade-rankui — 세 게임 + 메인이 공유하는 랭킹 화면 */
@@ -1961,11 +2049,6 @@ window.__race = {
     try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); }
     catch(e){ return null; }
   }
-  var uid = ls('arcade-uid');
-  if (!uid){
-    uid = Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4);
-    ls('arcade-uid', uid);
-  }
   // 이 게임이 뭔지 경로로 짐작해서 그 탭을 먼저 연다
   var SELF = (function(){
     try {
@@ -2014,14 +2097,22 @@ window.__race = {
       li2.textContent = '아직 기록이 없습니다 — 1등 하세요';
       list.appendChild(li2); return;
     }
-    for (var i = 0; i < g.top.length; i++) list.appendChild(row(g.top[i], g.top[i].uid === uid));
+    // v2: 응답 항목에 uid 가 없다. 게임 구간마다 오는 meTag(내 지문)와 각 행의 me 를 비교한다.
+    // meTag 는 내 기록이 그 게임 목록에 있을 때만 온다 — 없으면 강조할 행도 없다.
+    for (var i = 0; i < g.top.length; i++)
+      list.appendChild(row(g.top[i], !!g.meTag && g.top[i].me === g.meTag));
     if (g.me && g.me.rank > g.top.length) mine.textContent = '내 기록 ' + g.me.rank + '위 · ' + g.me.disp;
   }
   function load(){
     data = null; draw();
     // file:// 로 직접 열었으면 부를 서버가 없다 (README 가 안내하는 오프라인 플레이)
     try { if (location.protocol === 'file:'){ data = { err: 1 }; draw(); return; } } catch(e){}
-    fetch(API + '?n=10&uid=' + encodeURIComponent(uid), { cache: 'no-store' })
+    // uid 는 볼 때마다 새로 읽는다. v2 에서는 서버가 '판을 시작하는 순간' 에 발급하므로,
+    // 페이지가 뜰 때 한 번만 읽어 두면 첫 판을 끝내고 열었을 때 내 기록을 못 찾는다.
+    // (지어내면 안 된다 — 서명 없는 uid 는 서버가 그냥 버린다.)
+    var uid = ls('arcade-uid') || '';
+    // uid 가 없으면 파라미터째로 뺀다 — 서버는 서명된 uid 만 받고, 빈 값은 그냥 버려진다.
+    fetch(API + '?n=10' + (uid ? '&uid=' + encodeURIComponent(uid) : ''), { cache: 'no-store' })
       .then(function(r){ return r.json(); })
       .then(function(d){
         if (!d || !d.ok) throw new Error('bad');
@@ -2066,7 +2157,9 @@ window.__race = {
       e.stopPropagation();
     }, true);
   });
-  // 캔버스 게임이 window 에 걸어 둔 핸들러로 이벤트가 새지 않게 (반드시 버블 단계)
+  // 캔버스 게임이 window 에 걸어 둔 핸들러로 이벤트가 새지 않게 막는다.
+  // 반드시 "버블 단계" 여야 한다 — 캡처로 걸면 오버레이 안의 버튼(탭·닫기·저장)에
+  // 이벤트가 닿기도 전에 삼켜서 아무것도 안 눌린다. (실제로 그렇게 만들었다가 잡았다)
   ['touchstart','touchmove','touchend','mousedown','mouseup','click','pointerdown'].forEach(function(t){
     wrap.addEventListener(t, function(e){ e.stopPropagation(); }, false);
   });

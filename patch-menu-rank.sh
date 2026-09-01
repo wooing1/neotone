@@ -99,11 +99,6 @@ JS = """
     try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); }
     catch(e){ return null; }
   }
-  var uid = ls('arcade-uid');
-  if (!uid){
-    uid = Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4);
-    ls('arcade-uid', uid);
-  }
 
   // 이름 입력
   var nmi = document.getElementById('nmi');
@@ -142,7 +137,9 @@ JS = """
       box.appendChild(d); return;
     }
     var ol = document.createElement('ol');
-    for (var i = 0; i < g.top.length; i++) ol.appendChild(row(g.top[i], g.top[i].uid === uid));
+    // v2: uid 대신 지문으로 판단한다 (row.me === 그 게임의 meTag)
+    for (var i = 0; i < g.top.length; i++)
+      ol.appendChild(row(g.top[i], !!g.meTag && g.top[i].me === g.meTag));
     box.appendChild(ol);
     if (g.me && g.me.rank > g.top.length){
       var d2 = document.createElement('div'); d2.className = 'rkw';
@@ -152,7 +149,12 @@ JS = """
   }
   function load(){
     var boxes = document.querySelectorAll('.rk');
-    fetch(API + '?n=3&uid=' + encodeURIComponent(uid), { cache: 'no-store' })
+    // uid 는 볼 때마다 새로 읽는다. v2 에서는 서버가 '판을 시작하는 순간' 에 발급하므로,
+    // 페이지가 뜰 때 한 번만 읽어 두면 첫 판을 끝내고 열었을 때 내 기록을 못 찾는다.
+    // (지어내면 안 된다 — 서명 없는 uid 는 서버가 그냥 버린다.)
+    var uid = ls('arcade-uid') || '';
+    // uid 가 없으면 파라미터째로 뺀다 — 서버는 서명된 uid 만 받고, 빈 값은 그냥 버려진다.
+    fetch(API + '?n=3' + (uid ? '&uid=' + encodeURIComponent(uid) : ''), { cache: 'no-store' })
       .then(function(r){ return r.json(); })
       .then(function(d){
         if (!d || !d.ok) throw new Error('bad');
@@ -288,11 +290,6 @@ OVERLAY = """<style>
     try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); }
     catch(e){ return null; }
   }
-  var uid = ls('arcade-uid');
-  if (!uid){
-    uid = Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4);
-    ls('arcade-uid', uid);
-  }
   // 이 게임이 뭔지 경로로 짐작해서 그 탭을 먼저 연다
   var SELF = (function(){
     try {
@@ -341,14 +338,22 @@ OVERLAY = """<style>
       li2.textContent = '아직 기록이 없습니다 — 1등 하세요';
       list.appendChild(li2); return;
     }
-    for (var i = 0; i < g.top.length; i++) list.appendChild(row(g.top[i], g.top[i].uid === uid));
+    // v2: 응답 항목에 uid 가 없다. 게임 구간마다 오는 meTag(내 지문)와 각 행의 me 를 비교한다.
+    // meTag 는 내 기록이 그 게임 목록에 있을 때만 온다 — 없으면 강조할 행도 없다.
+    for (var i = 0; i < g.top.length; i++)
+      list.appendChild(row(g.top[i], !!g.meTag && g.top[i].me === g.meTag));
     if (g.me && g.me.rank > g.top.length) mine.textContent = '내 기록 ' + g.me.rank + '위 · ' + g.me.disp;
   }
   function load(){
     data = null; draw();
     // file:// 로 직접 열었으면 부를 서버가 없다 (README 가 안내하는 오프라인 플레이)
     try { if (location.protocol === 'file:'){ data = { err: 1 }; draw(); return; } } catch(e){}
-    fetch(API + '?n=10&uid=' + encodeURIComponent(uid), { cache: 'no-store' })
+    // uid 는 볼 때마다 새로 읽는다. v2 에서는 서버가 '판을 시작하는 순간' 에 발급하므로,
+    // 페이지가 뜰 때 한 번만 읽어 두면 첫 판을 끝내고 열었을 때 내 기록을 못 찾는다.
+    // (지어내면 안 된다 — 서명 없는 uid 는 서버가 그냥 버린다.)
+    var uid = ls('arcade-uid') || '';
+    // uid 가 없으면 파라미터째로 뺀다 — 서버는 서명된 uid 만 받고, 빈 값은 그냥 버려진다.
+    fetch(API + '?n=10' + (uid ? '&uid=' + encodeURIComponent(uid) : ''), { cache: 'no-store' })
       .then(function(r){ return r.json(); })
       .then(function(d){
         if (!d || !d.ok) throw new Error('bad');
@@ -393,7 +398,9 @@ OVERLAY = """<style>
       e.stopPropagation();
     }, true);
   });
-  // 캔버스 게임이 window 에 걸어 둔 핸들러로 이벤트가 새지 않게 (반드시 버블 단계)
+  // 캔버스 게임이 window 에 걸어 둔 핸들러로 이벤트가 새지 않게 막는다.
+  // 반드시 "버블 단계" 여야 한다 — 캡처로 걸면 오버레이 안의 버튼(탭·닫기·저장)에
+  // 이벤트가 닿기도 전에 삼켜서 아무것도 안 눌린다. (실제로 그렇게 만들었다가 잡았다)
   ['touchstart','touchmove','touchend','mousedown','mouseup','click','pointerdown'].forEach(function(t){
     wrap.addEventListener(t, function(e){ e.stopPropagation(); }, false);
   });
